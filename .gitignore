@@ -1,0 +1,5 @@
+/target
+*.o
+/compile_commands.json
+*.a
+/.cache
