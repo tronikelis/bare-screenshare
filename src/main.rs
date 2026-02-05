@@ -1,274 +1,18 @@
-use gstreamer::prelude::GstBinExtManual;
-use gstreamer::prelude::{ElementExt, ElementExtManual};
-use std::cell::RefCell;
-use std::io::Stdin;
-use std::os::fd::AsRawFd;
-use std::process::Stdio;
-use std::str::FromStr;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::{collections::HashMap, time};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    os::fd::{self, AsRawFd},
+};
 
-use gio::{Cancellable, glib::object::ObjectExt, prelude::DBusProxyExt};
+use gio::{
+    Cancellable,
+    glib::object::ObjectExt,
+    prelude::{DBusProxyExt, UnixFDListExtManual},
+};
 use glib::variant::ToVariant;
+use gstreamer::prelude::ElementExt;
 
 mod pipewire;
-
-// #[zbus::proxy(
-//     interface = "org.freedesktop.portal.Request",
-//     default_service = "org.freedesktop.portal.Desktop"
-// )]
-// pub trait Request {
-//     #[zbus(signal)]
-//     fn response(
-//         &self,
-//         response: u32,
-//         results: HashMap<String, zbus::zvariant::Value<'_>>,
-//     ) -> Result<()>;
-// }
-//
-// #[zbus::proxy(
-//     interface = "org.freedesktop.portal.Session",
-//     default_service = "org.freedesktop.portal.Desktop"
-// )]
-// pub trait Session {}
-//
-// #[zbus::proxy(
-//     interface = "org.freedesktop.portal.ScreenCast",
-//     default_service = "org.freedesktop.portal.Desktop",
-//     default_path = "/org/freedesktop/portal/desktop",
-//     assume_defaults = true
-// )]
-// pub trait ScreenCast {
-//     /// CreateSession method
-//     fn create_session(
-//         &self,
-//         options: std::collections::HashMap<&str, &zbus::zvariant::Value<'_>>,
-//     ) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
-//
-//     /// OpenPipeWireRemote method
-//     fn open_pipe_wire_remote(
-//         &self,
-//         session_handle: &zbus::zvariant::ObjectPath<'_>,
-//         options: std::collections::HashMap<&str, &zbus::zvariant::Value<'_>>,
-//     ) -> zbus::Result<zbus::zvariant::OwnedFd>;
-//
-//     /// SelectSources method
-//     fn select_sources(
-//         &self,
-//         session_handle: &zbus::zvariant::ObjectPath<'_>,
-//         options: std::collections::HashMap<&str, &zbus::zvariant::Value<'_>>,
-//     ) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
-//
-//     /// Start method
-//     fn start(
-//         &self,
-//         session_handle: &zbus::zvariant::ObjectPath<'_>,
-//         parent_window: &str,
-//         options: std::collections::HashMap<&str, &zbus::zvariant::Value<'_>>,
-//     ) -> zbus::Result<zbus::zvariant::OwnedObjectPath>;
-//
-//     /// AvailableCursorModes property
-//     #[zbus(property)]
-//     fn available_cursor_modes(&self) -> zbus::Result<u32>;
-//
-//     /// AvailableSourceTypes property
-//     #[zbus(property)]
-//     fn available_source_types(&self) -> zbus::Result<u32>;
-//
-//     /// version property
-//     #[zbus(property, name = "version")]
-//     fn version(&self) -> zbus::Result<u32>;
-// }
-//
-// fn get_connection_bus_unique_name(bus: &zbus::Connection) -> String {
-//     bus.unique_name()
-//         .unwrap()
-//         .trim_start_matches(':')
-//         .replace(".", "_")
-// }
-//
-// fn make_handle_token() -> String {
-//     let mut ten: [u8; 20] = [0; 20];
-//     rand::fill(&mut ten);
-//     ten.iter()
-//         .map(|v| format!("{:x}", v))
-//         .collect::<Vec<_>>()
-//         .join("")
-// }
-//
-// struct XdgSession<'a> {
-//     proxy: SessionProxy<'a>,
-// }
-//
-// impl<'a> XdgSession<'a> {
-//     async fn new(bus: &'a zbus::Connection) -> (Self, String) {
-//         let handle_token = make_handle_token();
-//
-//         let proxy = SessionProxy::new(
-//             bus,
-//             format!(
-//                 "/org/freedesktop/portal/desktop/session/{}/{}",
-//                 get_connection_bus_unique_name(bus),
-//                 &handle_token,
-//             ),
-//         )
-//         .await
-//         .unwrap();
-//
-//         (Self { proxy }, handle_token)
-//     }
-//
-//     fn assert_path(&self, path: &str) {
-//         assert_eq!(self.path(), path);
-//     }
-//
-//     fn path(&self) -> &zbus::zvariant::ObjectPath<'_> {
-//         self.proxy.0.path()
-//     }
-// }
-//
-// struct XdgRequest<'a> {
-//     proxy: RequestProxy<'a>,
-//     response_stream: ResponseStream,
-// }
-//
-// impl<'a> XdgRequest<'a> {
-//     async fn new(bus: &'a zbus::Connection) -> (Self, String) {
-//         let handle_token = make_handle_token();
-//
-//         let proxy = RequestProxy::new(
-//             bus,
-//             format!(
-//                 "/org/freedesktop/portal/desktop/request/{}/{}",
-//                 get_connection_bus_unique_name(bus),
-//                 &handle_token,
-//             ),
-//         )
-//         .await
-//         .unwrap();
-//
-//         let response_stream = proxy.receive_response().await.unwrap();
-//
-//         (
-//             Self {
-//                 response_stream,
-//                 proxy,
-//             },
-//             handle_token,
-//         )
-//     }
-//
-//     async fn wait(&mut self) -> Response {
-//         self.response_stream.next().await.unwrap()
-//     }
-//
-//     fn assert_path(&self, path: &str) {
-//         assert_eq!(self.path(), path);
-//     }
-//
-//     fn path(&self) -> &zbus::zvariant::ObjectPath<'_> {
-//         self.proxy.0.path()
-//     }
-// }
-//
-// struct XdgScreenCast<'a> {
-//     bus: &'a zbus::Connection,
-//     screen_cast_proxy: ScreenCastProxy<'a>,
-// }
-//
-// impl<'a> XdgScreenCast<'a> {
-//     async fn new(bus: &'a zbus::Connection) -> Self {
-//         Self {
-//             bus,
-//             screen_cast_proxy: ScreenCastProxy::new(bus).await.unwrap(),
-//         }
-//     }
-//
-//     async fn create_session(&self) -> XdgSession<'_> {
-//         let (mut request, handle_token) = XdgRequest::new(&self.bus).await;
-//         let (session, session_handle_token) = XdgSession::new(&self.bus).await;
-//
-//         let handle_token_variant = zbus::zvariant::Value::new(handle_token.clone());
-//         let session_handle_token_variant = zbus::zvariant::Value::new(session_handle_token.clone());
-//
-//         let (response, request_path) = futures::join!(
-//             request.wait(),
-//             self.screen_cast_proxy.create_session(HashMap::from([
-//                 ("handle_token", &handle_token_variant),
-//                 ("session_handle_token", &session_handle_token_variant),
-//             ]))
-//         );
-//         request.assert_path(request_path.unwrap().as_str());
-//         session.assert_path(
-//             match response
-//                 .args()
-//                 .unwrap()
-//                 .results()
-//                 .get("session_handle")
-//                 .unwrap()
-//             {
-//                 zbus::zvariant::Value::Str(v) => v.as_str(),
-//                 _ => unreachable!(),
-//             },
-//         );
-//
-//         session
-//     }
-//
-//     async fn select_sources(&self, session: &XdgSession<'_>) {
-//         let (mut request, handle_token) = XdgRequest::new(&self.bus).await;
-//
-//         let handle_token_variant = zbus::zvariant::Value::new(handle_token.clone());
-//         let (_, request_path) = futures::join!(
-//             request.wait(),
-//             self.screen_cast_proxy.select_sources(
-//                 session.path(),
-//                 HashMap::from([("handle_token", &handle_token_variant)]),
-//             )
-//         );
-//         request.assert_path(request_path.unwrap().as_str());
-//     }
-//
-//     async fn start(&self, session: &XdgSession<'_>) -> u32 {
-//         let (mut request, handle_token) = XdgRequest::new(&self.bus).await;
-//
-//         let handle_token_variant = zbus::zvariant::Value::new(handle_token.clone());
-//         let (response, request_path) = futures::join!(
-//             request.wait(),
-//             self.screen_cast_proxy.start(
-//                 session.path(),
-//                 "parent-window?",
-//                 HashMap::from([("handle_token", &handle_token_variant)]),
-//             )
-//         );
-//         request.assert_path(request_path.unwrap().as_str());
-//
-//         match response.args().unwrap().results.get("streams").unwrap() {
-//             zbus::zvariant::Value::Array(array) => match array.first().unwrap() {
-//                 zbus::zvariant::Value::Structure(structure) => {
-//                     match structure.fields().first().unwrap() {
-//                         zbus::zvariant::Value::U32(v) => *v,
-//                         _ => unreachable!(),
-//                     }
-//                 }
-//                 _ => unreachable!(),
-//             },
-//             _ => unreachable!(),
-//         }
-//     }
-//
-//     async fn open_pipe_wire_remote(
-//         &self,
-//         session: &XdgSession<'_>,
-//         options: HashMap<&str, &zbus::zvariant::Value<'_>>,
-//     ) -> zbus::zvariant::OwnedFd {
-//         self.screen_cast_proxy
-//             .open_pipe_wire_remote(session.path(), options)
-//             .await
-//             .unwrap()
-//     }
-// }
 
 fn main() {
     let bus_connection =
@@ -286,7 +30,7 @@ fn main() {
 
     let pipeline = gstreamer::parse::launch(&format!(
         "pipewiresrc fd={} path={} do-timestamp=true ! videoconvertscale ! waylandsink sync=false enable-last-sample=false",
-        pipewire_fd,
+        pipewire_fd.as_raw_fd(),
         pipewire_node_id,
     ))
     .unwrap();
@@ -298,22 +42,7 @@ fn main() {
     for message in pipeline.bus().unwrap().iter_timed_filtered(
         gstreamer::ClockTime::NONE,
         &[gstreamer::MessageType::Error, gstreamer::MessageType::Eos],
-    ) {
-        // use gstreamer::MessageView;
-        // match message.view() {
-        //     MessageView::Eos(..) => break,
-        //     MessageView::Error(err) => {
-        //         println!(
-        //             "Error from {:?}: {} ({:?})",
-        //             err.src().map(|s| s.to_string()),
-        //             err.error(),
-        //             err.debug()
-        //         );
-        //         break;
-        //     }
-        //     _ => {}
-        // }
-    }
+    ) {}
 }
 
 fn call_request_proxy_signal(
@@ -475,10 +204,10 @@ impl<'a> ScreenCastProxy<'a> {
         }
     }
 
-    fn open_pipewire_remote(&self, session_proxy: &SessionProxy) -> i32 {
+    fn open_pipewire_remote(&self, session_proxy: &SessionProxy) -> fd::OwnedFd {
         let response = self
             .proxy
-            .call_sync(
+            .call_with_unix_fd_list_sync(
                 "OpenPipeWireRemote",
                 Some(&glib::Variant::tuple_from_iter([
                     session_proxy.object_path().unwrap().to_variant(),
@@ -486,13 +215,12 @@ impl<'a> ScreenCastProxy<'a> {
                 ])),
                 gio::DBusCallFlags::empty(),
                 -1,
+                None::<&gio::UnixFDList>,
                 None::<&Cancellable>,
             )
             .unwrap();
 
-        let response: Option<(glib::variant::Handle,)> = response.get();
-        let response = response.unwrap();
-        response.0.0
+        response.1.unwrap().get(0).unwrap()
     }
 
     fn select_sources(&self, session_proxy: &SessionProxy) -> Result<(), ()> {
