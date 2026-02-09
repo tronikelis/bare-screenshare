@@ -7,8 +7,6 @@ edition = "2024"
 gio = "0.21.5"
 glib = "0.21.5"
 gstreamer = "0.24.4"
-# futures = "0.3.31"
-# gstreamer = "0.24.4"
+gstreamer-app = "0.24.4"
 rand = "0.9.2"
-# tokio = { version = "1.49.0", features = ["full"] }
-# zbus = "5.13.1"
+raylib = { path = "../raylib" }

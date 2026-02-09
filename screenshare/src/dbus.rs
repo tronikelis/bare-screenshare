@@ -1,8 +1,4 @@
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    os::fd::{self, AsRawFd},
-};
+use std::{cell::RefCell, collections::HashMap, os::fd};
 
 use gio::{
     Cancellable,
@@ -10,39 +6,9 @@ use gio::{
     prelude::{DBusProxyExt, UnixFDListExtManual},
 };
 use glib::variant::ToVariant;
-use gstreamer::prelude::ElementExt;
 
-mod pipewire;
-
-fn main() {
-    let bus_connection =
-        gio::functions::bus_get_sync(gio::BusType::Session, None::<&Cancellable>).unwrap();
-
-    let screen_cast_proxy = ScreenCastProxy::new(&bus_connection);
-
-    let session_proxy = screen_cast_proxy.create_session().unwrap();
-
-    screen_cast_proxy.select_sources(&session_proxy).unwrap();
-    let pipewire_node_id = screen_cast_proxy.start(&session_proxy).unwrap();
-    let pipewire_fd = screen_cast_proxy.open_pipewire_remote(&session_proxy);
-
-    gstreamer::init().unwrap();
-
-    let pipeline = gstreamer::parse::launch(&format!(
-        "pipewiresrc fd={} path={} do-timestamp=true ! videoconvertscale ! waylandsink sync=false enable-last-sample=false",
-        pipewire_fd.as_raw_fd(),
-        pipewire_node_id,
-    ))
-    .unwrap();
-
-    pipeline
-        .set_state(gstreamer::State::Playing)
-        .expect("Unable to set the pipeline to the `Playing` state");
-
-    for message in pipeline.bus().unwrap().iter_timed_filtered(
-        gstreamer::ClockTime::NONE,
-        &[gstreamer::MessageType::Error, gstreamer::MessageType::Eos],
-    ) {}
+pub fn bus_connection_get_session() -> gio::DBusConnection {
+    gio::functions::bus_get_sync(gio::BusType::Session, None::<&Cancellable>).unwrap()
 }
 
 fn call_request_proxy_signal(
@@ -105,7 +71,7 @@ fn make_dbus_handle_token() -> String {
         .join("")
 }
 
-struct SessionProxy {
+pub struct SessionProxy {
     proxy: gio::DBusProxy,
 }
 
@@ -130,12 +96,12 @@ impl SessionProxy {
     }
 }
 
-struct ScreenCastProxy<'a> {
+pub struct ScreenCastProxy<'a> {
     proxy: gio::DBusProxy,
     bus: &'a gio::DBusConnection,
 }
 
-struct DBusConnection(pub gio::DBusConnection);
+struct DBusConnection(gio::DBusConnection);
 
 impl DBusConnection {
     fn xdg_unique_name(&self) -> Option<String> {
@@ -156,7 +122,7 @@ impl From<gio::DBusConnection> for DBusConnection {
 }
 
 impl<'a> ScreenCastProxy<'a> {
-    fn new(bus: &'a gio::DBusConnection) -> Self {
+    pub fn new(bus: &'a gio::DBusConnection) -> Self {
         let proxy = gio::DBusProxy::new_sync(
             bus,
             gio::DBusProxyFlags::empty(),
@@ -171,7 +137,7 @@ impl<'a> ScreenCastProxy<'a> {
         Self { proxy, bus }
     }
 
-    fn create_session(&self) -> Result<SessionProxy, ()> {
+    pub fn create_session(&self) -> Result<SessionProxy, ()> {
         let response = call_request_proxy_signal(self.bus, |handle_token| {
             self.proxy
                 .call_sync(
@@ -204,7 +170,7 @@ impl<'a> ScreenCastProxy<'a> {
         }
     }
 
-    fn open_pipewire_remote(&self, session_proxy: &SessionProxy) -> fd::OwnedFd {
+    pub fn open_pipewire_remote(&self, session_proxy: &SessionProxy) -> fd::OwnedFd {
         let response = self
             .proxy
             .call_with_unix_fd_list_sync(
@@ -223,7 +189,7 @@ impl<'a> ScreenCastProxy<'a> {
         response.1.unwrap().get(0).unwrap()
     }
 
-    fn select_sources(&self, session_proxy: &SessionProxy) -> Result<(), ()> {
+    pub fn select_sources(&self, session_proxy: &SessionProxy) -> Result<(), ()> {
         let response = call_request_proxy_signal(self.bus, |handle_token| {
             self.proxy
                 .call_sync(
@@ -244,7 +210,7 @@ impl<'a> ScreenCastProxy<'a> {
         if response.0 != 0 { Err(()) } else { Ok(()) }
     }
 
-    fn start(&self, session_proxy: &SessionProxy) -> Result<u32, ()> {
+    pub fn start(&self, session_proxy: &SessionProxy) -> Result<u32, ()> {
         let response = call_request_proxy_signal(self.bus, |handle_token| {
             self.proxy
                 .call_sync(
