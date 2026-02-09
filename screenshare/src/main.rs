@@ -10,7 +10,6 @@ use glib::object::ObjectExt;
 use gstreamer::prelude::{ElementExt, GstBinExtManual};
 
 mod dbus;
-mod pipewire;
 
 fn main() {
     let bus_connection = dbus::bus_connection_get_session();
