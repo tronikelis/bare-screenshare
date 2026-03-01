@@ -2,7 +2,6 @@ use gstreamer as gst;
 use gstreamer_app as gst_app;
 
 use std::{
-    cell::{RefCell, UnsafeCell},
     os::fd::{AsRawFd, OwnedFd},
     sync::{Arc, Mutex},
     thread,
@@ -14,11 +13,43 @@ use gst::prelude::{ElementExt, GstBinExtManual};
 
 use crate::{dbus, macros};
 
-pub type Frame = Arc<[u8]>;
+struct SampleBytes {
+    memory: gst::MappedMemory<gst::memory::Readable>,
+}
+
+impl From<gst::Sample> for SampleBytes {
+    fn from(value: gst::Sample) -> Self {
+        Self {
+            memory: value
+                .buffer()
+                .unwrap()
+                .memory(0)
+                .unwrap()
+                .into_mapped_memory_readable()
+                .unwrap(),
+        }
+    }
+}
+
+impl From<SampleBytes> for bytes::Bytes {
+    fn from(value: SampleBytes) -> Self {
+        Self::from_owner(value)
+    }
+}
+
+impl AsRef<[u8]> for SampleBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.memory.as_ref()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum VideoMessage {
+    Frame(bytes::Bytes),
+}
 
 pub struct VideoPipeline {
     pipeline: gst::Pipeline,
-    appsink: gst_app::AppSink,
     worker: Option<thread::JoinHandle<()>>,
 
     // only for dropping later
@@ -26,14 +57,8 @@ pub struct VideoPipeline {
     _screen_cast_proxy: dbus::ScreenCastProxy,
 }
 
-fn sample_to_bytes(sample: &gst::Sample) -> Vec<u8> {
-    let memory = sample.buffer().unwrap().memory(0).unwrap();
-    let memory_readable = memory.map_readable().unwrap();
-    memory_readable.as_slice().to_vec()
-}
-
 impl VideoPipeline {
-    pub fn new(frame_tx: channel::mpsc::Sender<Frame>) -> Self {
+    pub fn new(message_tx: channel::mpsc::Sender<VideoMessage>) -> Self {
         let bus_connection = dbus::bus_connection_get_session();
         let screen_cast_proxy = dbus::ScreenCastProxy::new(bus_connection);
 
@@ -54,7 +79,7 @@ impl VideoPipeline {
         let videoconvertscale = gstreamer::ElementFactory::make("videoconvertscale")
             .build()
             .unwrap();
-        let appsink = gstreamer_app::AppSink::builder()
+        let appsink = gst_app::AppSink::builder()
             .drop(true)
             .caps(
                 &gstreamer::Caps::builder("video/x-raw")
@@ -68,15 +93,14 @@ impl VideoPipeline {
         pipeline.add_many(elements).unwrap();
         gstreamer::Element::link_many(elements).unwrap();
 
-        let frame_tx = Mutex::new(frame_tx);
+        let message_tx = Mutex::new(message_tx);
         appsink.connect_closure(
             "new-sample",
             true,
             glib::closure!(move |sink: &gstreamer_app::AppSink| {
-                let _ = frame_tx
-                    .lock()
-                    .unwrap()
-                    .try_send(Arc::from(sample_to_bytes(&sink.pull_sample().unwrap())));
+                let mut message_tx = message_tx.lock().unwrap();
+                let sample_bytes: SampleBytes = sink.pull_sample().unwrap().into();
+                let _ = message_tx.try_send(VideoMessage::Frame(sample_bytes.into()));
                 gstreamer::FlowReturn::Ok
             }),
         );
@@ -113,7 +137,6 @@ impl VideoPipeline {
 
         Self {
             pipeline,
-            appsink,
             worker: Some(worker),
 
             _pipewirefd: pipewire_fd,
