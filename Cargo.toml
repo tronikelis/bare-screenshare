@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+rand = "0.9.2"
 gio = "0.21.5"
 glib = "0.21.5"
 gstreamer = "0.24.4"
 gstreamer-app = "0.24.4"
-rand = "0.9.2"
-raylib = { path = "../raylib" }
+iced = { version = "0.14.0", features = ["image", "advanced", "sipper"] }
+futures = { version = "0.3.32", features = ["thread-pool"] }

@@ -71,6 +71,7 @@ fn make_dbus_handle_token() -> String {
         .join("")
 }
 
+#[derive(Debug)]
 pub struct SessionProxy {
     proxy: gio::DBusProxy,
 }
@@ -94,11 +95,31 @@ impl SessionProxy {
     fn object_path(&self) -> Result<glib::variant::ObjectPath, glib::BoolError> {
         self.proxy.object_path().to_string().try_into()
     }
+
+    pub fn close(&self) {
+        self.proxy
+            .call_sync(
+                "Close",
+                None,
+                gio::DBusCallFlags::empty(),
+                -1,
+                None::<&Cancellable>,
+            )
+            .unwrap();
+    }
 }
 
-pub struct ScreenCastProxy<'a> {
+impl Drop for SessionProxy {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+#[derive(Debug)]
+pub struct ScreenCastProxy {
     proxy: gio::DBusProxy,
-    bus: &'a gio::DBusConnection,
+    bus: gio::DBusConnection,
+    session_proxy: SessionProxy,
 }
 
 struct DBusConnection(gio::DBusConnection);
@@ -121,10 +142,10 @@ impl From<gio::DBusConnection> for DBusConnection {
     }
 }
 
-impl<'a> ScreenCastProxy<'a> {
-    pub fn new(bus: &'a gio::DBusConnection) -> Self {
+impl ScreenCastProxy {
+    pub fn new(bus: gio::DBusConnection) -> Self {
         let proxy = gio::DBusProxy::new_sync(
-            bus,
+            &bus,
             gio::DBusProxyFlags::empty(),
             None,
             Some("org.freedesktop.portal.Desktop"),
@@ -134,12 +155,16 @@ impl<'a> ScreenCastProxy<'a> {
         )
         .unwrap();
 
-        Self { proxy, bus }
+        Self {
+            proxy: proxy.clone(),
+            bus: bus.clone(),
+            session_proxy: Self::create_session(bus, proxy).unwrap(),
+        }
     }
 
-    pub fn create_session(&self) -> Result<SessionProxy, ()> {
-        let response = call_request_proxy_signal(self.bus, |handle_token| {
-            self.proxy
+    fn create_session(bus: gio::DBusConnection, proxy: gio::DBusProxy) -> Result<SessionProxy, ()> {
+        let response = call_request_proxy_signal(&bus, |handle_token| {
+            proxy
                 .call_sync(
                     "CreateSession",
                     Some(&glib::Variant::tuple_from_iter([HashMap::from([
@@ -158,7 +183,7 @@ impl<'a> ScreenCastProxy<'a> {
         let response: Option<(u32, HashMap<String, glib::Variant>)> = response.get();
         let response = response.unwrap();
 
-        let session = SessionProxy::new(&self.bus, {
+        let session = SessionProxy::new(&bus, {
             let v: &glib::variant::Variant = response.1.get("session_handle").unwrap();
             v.get().unwrap()
         });
@@ -170,13 +195,13 @@ impl<'a> ScreenCastProxy<'a> {
         }
     }
 
-    pub fn open_pipewire_remote(&self, session_proxy: &SessionProxy) -> fd::OwnedFd {
+    pub fn open_pipewire_remote(&self) -> fd::OwnedFd {
         let response = self
             .proxy
             .call_with_unix_fd_list_sync(
                 "OpenPipeWireRemote",
                 Some(&glib::Variant::tuple_from_iter([
-                    session_proxy.object_path().unwrap().to_variant(),
+                    self.session_proxy.object_path().unwrap().to_variant(),
                     HashMap::<String, glib::Variant>::new().to_variant(),
                 ])),
                 gio::DBusCallFlags::empty(),
@@ -189,13 +214,13 @@ impl<'a> ScreenCastProxy<'a> {
         response.1.unwrap().get(0).unwrap()
     }
 
-    pub fn select_sources(&self, session_proxy: &SessionProxy) -> Result<(), ()> {
-        let response = call_request_proxy_signal(self.bus, |handle_token| {
+    pub fn select_sources(&self) -> Result<(), ()> {
+        let response = call_request_proxy_signal(&self.bus, |handle_token| {
             self.proxy
                 .call_sync(
                     "SelectSources",
                     Some(&glib::Variant::tuple_from_iter([
-                        session_proxy.object_path().unwrap().to_variant(),
+                        self.session_proxy.object_path().unwrap().to_variant(),
                         HashMap::from([("handle_token", handle_token.to_variant())]).to_variant(),
                     ])),
                     gio::DBusCallFlags::empty(),
@@ -210,13 +235,13 @@ impl<'a> ScreenCastProxy<'a> {
         if response.0 != 0 { Err(()) } else { Ok(()) }
     }
 
-    pub fn start(&self, session_proxy: &SessionProxy) -> Result<u32, ()> {
-        let response = call_request_proxy_signal(self.bus, |handle_token| {
+    pub fn start(&self) -> Result<u32, ()> {
+        let response = call_request_proxy_signal(&self.bus, |handle_token| {
             self.proxy
                 .call_sync(
                     "Start",
                     Some(&glib::Variant::tuple_from_iter([
-                        session_proxy.object_path().unwrap().to_variant(),
+                        self.session_proxy.object_path().unwrap().to_variant(),
                         "parent-window?".to_variant(),
                         HashMap::from([("handle_token", handle_token.to_variant())]).to_variant(),
                     ])),

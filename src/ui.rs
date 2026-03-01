@@ -1,0 +1,60 @@
+use crate::video;
+
+use futures::{channel, stream};
+use iced::{Element, Task, advanced, task, widget::image};
+
+#[derive(Debug, Clone)]
+pub enum VideoStreamMessage {
+    Frame(video::Frame),
+    FrameAllocated(Result<advanced::image::Allocation, advanced::image::Error>),
+}
+
+pub struct VideoStream {
+    image_alloc_handle: Option<task::Handle>,
+    image_alloc: Option<image::Allocation>,
+    pipeline: video::VideoPipeline,
+}
+
+impl VideoStream {
+    pub fn new() -> (Self, iced::Task<VideoStreamMessage>) {
+        let (frame_tx, frame_rx) = channel::mpsc::channel(16);
+        let pipeline = video::VideoPipeline::new(frame_tx);
+
+        let slf = Self {
+            image_alloc_handle: None,
+            image_alloc: None,
+            pipeline,
+        };
+
+        let task = iced::Task::stream(stream::unfold(frame_rx, async |mut frame_rx| {
+            frame_rx.recv().await.ok().map(|v| (v, frame_rx))
+        }))
+        .map(|v| VideoStreamMessage::Frame(v));
+
+        (slf, task)
+    }
+
+    pub fn view<T>(&self) -> Element<'_, T> {
+        self.image_alloc.clone().map(|v| image(v.handle())).into()
+    }
+
+    pub fn update(&mut self, message: VideoStreamMessage) -> iced::Task<VideoStreamMessage> {
+        match message {
+            VideoStreamMessage::Frame(frame) => {
+                let (task, abort) = image::allocate(image::Handle::from_rgba(
+                    1920,
+                    1080,
+                    (&frame as &[u8]).to_vec(),
+                ))
+                .map(|v| VideoStreamMessage::FrameAllocated(v))
+                .abortable();
+                self.image_alloc_handle = Some(abort.abort_on_drop());
+                task
+            }
+            VideoStreamMessage::FrameAllocated(allocation) => {
+                self.image_alloc = Some(allocation.unwrap());
+                Task::none()
+            }
+        }
+    }
+}

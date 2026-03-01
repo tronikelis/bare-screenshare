@@ -1,7 +1,0 @@
-[package]
-name = "raylib"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-raylib_sys = { path = "../raylib_sys" }
