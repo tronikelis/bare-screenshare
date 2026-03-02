@@ -1,15 +1,16 @@
-use gstreamer as gst;
-use gstreamer_app as gst_app;
-
 use std::{
     os::fd::{AsRawFd, OwnedFd},
     sync::{Arc, Mutex},
     thread,
 };
 
-use futures::channel;
+use futures::{SinkExt, channel, executor};
 use glib::object::ObjectExt;
-use gst::prelude::{ElementExt, GstBinExtManual};
+use gstreamer::{
+    self as gst,
+    prelude::{ElementExt, ElementExtManual, GstBinExtManual, PadExt},
+};
+use gstreamer_app as gst_app;
 
 use crate::{dbus, macros};
 
@@ -46,6 +47,7 @@ impl AsRef<[u8]> for SampleBytes {
 #[derive(Debug, Clone)]
 pub enum VideoMessage {
     Frame(bytes::Bytes),
+    Caps(gst::Caps),
 }
 
 pub struct VideoPipeline {
@@ -58,7 +60,7 @@ pub struct VideoPipeline {
 }
 
 impl VideoPipeline {
-    pub fn new(message_tx: channel::mpsc::Sender<VideoMessage>) -> Self {
+    pub fn new(mut message_tx: channel::mpsc::Sender<VideoMessage>) -> Self {
         let bus_connection = dbus::bus_connection_get_session();
         let screen_cast_proxy = dbus::ScreenCastProxy::new(bus_connection);
 
@@ -93,12 +95,12 @@ impl VideoPipeline {
         pipeline.add_many(elements).unwrap();
         gstreamer::Element::link_many(elements).unwrap();
 
-        let message_tx = Mutex::new(message_tx);
+        let message_tx_mu = Mutex::new(message_tx.clone());
         appsink.connect_closure(
             "new-sample",
             true,
             glib::closure!(move |sink: &gstreamer_app::AppSink| {
-                let mut message_tx = message_tx.lock().unwrap();
+                let mut message_tx = message_tx_mu.lock().unwrap();
                 let sample_bytes: SampleBytes = sink.pull_sample().unwrap().into();
                 let _ = message_tx.try_send(VideoMessage::Frame(sample_bytes.into()));
                 gstreamer::FlowReturn::Ok
@@ -117,6 +119,15 @@ impl VideoPipeline {
                             match v.current() {
                                 gst::State::Null => {
                                     break
+                                }
+                                gst::State::Playing => {
+                                    if let Some(caps) = appsink.pads()[0].current_caps() {
+                                        executor::block_on(async {
+                                            let _ = message_tx.send(VideoMessage::Caps(
+                                                caps
+                                            )).await;
+                                        })
+                                    }
                                 }
                                 _ => {}
                             }

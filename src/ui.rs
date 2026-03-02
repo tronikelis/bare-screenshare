@@ -1,7 +1,8 @@
-use crate::{macros, video};
-
 use futures::{channel, stream};
+use gstreamer as gst;
 use iced::{Element, Task, advanced, task, widget::image};
+
+use crate::{macros, video};
 
 #[derive(Debug, Clone)]
 pub enum VideoStreamMessage {
@@ -13,6 +14,7 @@ pub struct VideoStream {
     image_alloc_handle: Option<task::Handle>,
     image_alloc: Option<image::Allocation>,
     pipeline: video::VideoPipeline,
+    caps: Option<gst::Caps>,
 }
 
 impl VideoStream {
@@ -23,11 +25,12 @@ impl VideoStream {
         let slf = Self {
             image_alloc_handle: None,
             image_alloc: None,
+            caps: None,
             pipeline,
         };
 
-        let task = iced::Task::stream(stream::unfold(message_rx, async |mut frame_rx| {
-            frame_rx.recv().await.ok().map(|v| (v, frame_rx))
+        let task = iced::Task::stream(stream::unfold(message_rx, async |mut message_rx| {
+            message_rx.recv().await.ok().map(|v| (v, message_rx))
         }))
         .map(|v| VideoStreamMessage::PipelineMessage(v));
 
@@ -42,12 +45,28 @@ impl VideoStream {
         match message {
             VideoStreamMessage::PipelineMessage(message) => match message {
                 video::VideoMessage::Frame(bytes) => {
-                    let (task, abort) =
-                        image::allocate(image::Handle::from_rgba(1920, 1080, bytes))
-                            .map(|v| VideoStreamMessage::FrameAllocated(v))
-                            .abortable();
-                    self.image_alloc_handle = Some(abort.abort_on_drop());
-                    task
+                    if let Some(caps) = self.caps.as_ref() {
+                        let structure = caps.structure(0).unwrap();
+                        let width: i32 = structure.get("width").unwrap();
+                        let height: i32 = structure.get("height").unwrap();
+
+                        let (task, abort) = image::allocate(image::Handle::from_rgba(
+                            width as _,
+                            height as _,
+                            bytes,
+                        ))
+                        .map(|v| VideoStreamMessage::FrameAllocated(v))
+                        .abortable();
+                        self.image_alloc_handle = Some(abort.abort_on_drop());
+
+                        task
+                    } else {
+                        Task::none()
+                    }
+                }
+                video::VideoMessage::Caps(caps) => {
+                    self.caps = Some(caps);
+                    Task::none()
                 }
             },
             VideoStreamMessage::FrameAllocated(allocation) => {
