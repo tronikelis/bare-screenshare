@@ -5,6 +5,7 @@ use iced::{
 
 mod dbus;
 mod macros;
+mod pipeline;
 mod ui;
 mod video;
 
@@ -53,6 +54,7 @@ impl App {
 }
 
 fn main() {
+    gstreamer::init().unwrap();
     iced::application(App::new, App::update, App::view)
         .run()
         .unwrap()

@@ -1,18 +1,16 @@
 use std::{
     os::fd::{AsRawFd, OwnedFd},
-    sync::{Arc, Mutex},
+    str::FromStr,
+    sync::Mutex,
     thread,
 };
 
 use futures::{SinkExt, channel, executor};
 use glib::object::ObjectExt;
-use gstreamer::{
-    self as gst,
-    prelude::{ElementExt, ElementExtManual, GstBinExtManual, PadExt},
-};
+use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as gst_app;
 
-use crate::{dbus, macros};
+use crate::{dbus, macros, pipeline};
 
 struct SampleBytes {
     memory: gst::MappedMemory<gst::memory::Readable>,
@@ -69,50 +67,79 @@ impl VideoPipeline {
         let pipewire_node_id = screen_cast_proxy.start().unwrap();
         let pipewire_fd = screen_cast_proxy.open_pipewire_remote();
 
-        gst::init().unwrap();
-
-        let pipeline = gstreamer::Pipeline::new();
-        let pipewiresrc = gstreamer::ElementFactory::make("pipewiresrc")
+        let pipewiresrc = gst::ElementFactory::make("pipewiresrc")
+            .property("do-timestamp", true)
             .property("fd", pipewire_fd.as_raw_fd())
             .property("path", pipewire_node_id.to_string())
             .build()
             .unwrap();
 
-        let videoconvertscale = gstreamer::ElementFactory::make("videoconvertscale")
+        let tee = gst::ElementFactory::make("tee").build().unwrap();
+
+        let videoconvertscale1 = gst::ElementFactory::make("videoconvertscale")
             .build()
             .unwrap();
+        let videoconvertscale2 = gst::ElementFactory::make("videoconvertscale")
+            .build()
+            .unwrap();
+
+        let queue1 = gst::ElementFactory::make("queue")
+            .property_from_str("leaky", "downstream")
+            .build()
+            .unwrap();
+        let queue2 = gst::ElementFactory::make("queue").build().unwrap();
+
+        let vp9enc = gst::ElementFactory::make("vp9enc")
+            .property("deadline", 1i64)
+            .property("cpu-used", 16)
+            .build()
+            .unwrap();
+        let vp9payloader = gst::ElementFactory::make("rtpvp9pay").build().unwrap();
+
         let appsink = gst_app::AppSink::builder()
+            .sync(false)
             .drop(true)
-            .caps(
-                &gstreamer::Caps::builder("video/x-raw")
-                    .field("format", "RGBA")
-                    .build(),
-            )
+            .caps(&gst::Caps::from_str("video/x-raw,format=RGBA").unwrap())
             .property("emit-signals", true)
             .build();
 
-        let elements = [&pipewiresrc, &videoconvertscale, &appsink.clone().into()];
-        pipeline.add_many(elements).unwrap();
-        gstreamer::Element::link_many(elements).unwrap();
+        let udpsink = gst::ElementFactory::make("udpsink")
+            .property("sync", false)
+            .property("port", 3000)
+            .build()
+            .unwrap();
+
+        let pipeline = gst::Pipeline::new();
+        pipeline::Pipeline::new(&pipeline)
+            .link([&pipewiresrc, &tee])
+            .link([&tee, &queue1, &videoconvertscale1, &appsink.clone().into()])
+            .link([
+                &tee,
+                &queue2,
+                &videoconvertscale2,
+                &vp9enc,
+                &vp9payloader,
+                &udpsink,
+            ]);
 
         let message_tx_mu = Mutex::new(message_tx.clone());
         appsink.connect_closure(
             "new-sample",
             true,
-            glib::closure!(move |sink: &gstreamer_app::AppSink| {
+            glib::closure!(move |sink: &gst_app::AppSink| {
                 let mut message_tx = message_tx_mu.lock().unwrap();
                 let sample_bytes: SampleBytes = sink.pull_sample().unwrap().into();
                 let _ = message_tx.try_send(VideoMessage::Frame(sample_bytes.into()));
-                gstreamer::FlowReturn::Ok
+                gst::FlowReturn::Ok
             }),
         );
 
         let worker = thread::spawn(macros::clone_expr!(
             pipeline => move || {
-                pipeline.set_state(gstreamer::State::Playing).unwrap();
+                pipeline.set_state(gst::State::Playing).unwrap();
                 for message in pipeline.bus().unwrap().iter_timed_filtered(
-                    gstreamer::ClockTime::NONE,
-                    &[gstreamer::MessageType::Error, gstreamer::MessageType::Eos, gst::MessageType::StateChanged],
+                    gst::ClockTime::NONE,
+                    &[gst::MessageType::Error, gst::MessageType::Eos, gst::MessageType::StateChanged],
                 ) {
                     match message.view() {
                         gst::MessageView::StateChanged(v) => {
@@ -132,11 +159,11 @@ impl VideoPipeline {
                                 _ => {}
                             }
                         }
-                        gstreamer::MessageView::Eos(_) => {
+                        gst::MessageView::Eos(_) => {
                             dbg!("eos");
                             break;
                         }
-                        gstreamer::MessageView::Error(v) => {
+                        gst::MessageView::Error(v) => {
                             dbg!("err", v);
                             break;
                         }
