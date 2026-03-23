@@ -6,9 +6,9 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn new(inner: &gst::Pipeline) -> Self {
+    pub fn new(pipeline: gst::Pipeline) -> Self {
         Self {
-            pipeline: inner.clone(),
+            pipeline,
             elements: vec![],
         }
     }
@@ -40,5 +40,9 @@ impl Pipeline {
 
         gst::Element::link_many(&elements).unwrap();
         self
+    }
+
+    pub fn gst_pipeline(self) -> gst::Pipeline {
+        self.pipeline
     }
 }

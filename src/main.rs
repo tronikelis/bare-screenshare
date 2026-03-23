@@ -1,7 +1,4 @@
-use iced::{
-    Element,
-    widget::{button, column, text},
-};
+use iced::{Element, Task};
 
 mod dbus;
 mod macros;
@@ -9,46 +6,39 @@ mod pipeline;
 mod ui;
 mod video;
 
-#[derive(Debug, Clone)]
-enum Message {
-    Start,
-    UiVideoStream(ui::VideoStreamMessage),
-}
-
 struct App {
-    ui_video_stream: Option<ui::VideoStream>,
+    screen: ui::Screen,
 }
 
 impl App {
     fn new() -> Self {
         Self {
-            ui_video_stream: None,
+            screen: ui::Screen::MainMenu(ui::MainMenu::new()),
         }
     }
 
-    fn view(&self) -> Element<'_, Message> {
-        column![
-            button("Start").on_press(Message::Start),
-            text("nice"),
-            self.ui_video_stream.as_ref().map(|v| v.view()),
-        ]
-        .spacing(10)
-        .into()
+    fn view(&self) -> Element<'_, ui::Message> {
+        match &self.screen {
+            ui::Screen::MainMenu(v) => v.view().map(ui::Message::MainMenuMessage),
+            ui::Screen::Lobby(v) => v.view().map(ui::Message::LobbyMessage),
+        }
     }
 
-    fn update(&mut self, message: Message) -> iced::Task<Message> {
+    fn update(&mut self, message: ui::Message) -> Task<ui::Message> {
         match message {
-            Message::Start => {
-                let (video_stream, task) = ui::VideoStream::new();
-                self.ui_video_stream = Some(video_stream);
-                task.map(|v| Message::UiVideoStream(v))
-            }
-            Message::UiVideoStream(v) => self
-                .ui_video_stream
-                .as_mut()
-                .map(move |video_stream| video_stream.update(v))
-                .unwrap_or(iced::Task::none())
-                .map(|v| Message::UiVideoStream(v)),
+            ui::Message::MainMenuMessage(v) => match v {
+                ui::MainMenuMessage::CreateLobby => {
+                    self.screen = ui::Screen::Lobby(ui::Lobby::new(String::from("foo-bar")));
+                    Task::none()
+                }
+            },
+            ui::Message::LobbyMessage(v) => match v {
+                ui::LobbyMessage::Leave => {
+                    self.screen = ui::Screen::MainMenu(ui::MainMenu::new());
+                    Task::none()
+                }
+                v => self.screen.lobby().update(v).map(ui::Message::LobbyMessage),
+            },
         }
     }
 }
