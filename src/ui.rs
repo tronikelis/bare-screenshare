@@ -169,25 +169,26 @@ impl MyStream {
             .unwrap();
         let queue2 = gst::ElementFactory::make("queue").build().unwrap();
 
-        let vp9enc = gst::ElementFactory::make("vp9enc")
-            .property("deadline", 1i64)
-            .property("cpu-used", 16)
+        let encoder = gst::ElementFactory::make("x264enc")
+            .property_from_str("tune", "zerolatency")
             .build()
             .unwrap();
-        let vp9payloader = gst::ElementFactory::make("rtpvp9pay").build().unwrap();
+        let payloader = gst::ElementFactory::make("rtph264pay").build().unwrap();
 
         let appsink = gst_app::AppSink::builder()
-            .sync(false)
             .drop(true)
             .caps(&gst::Caps::from_str("video/x-raw,format=RGBA").unwrap())
             .property("emit-signals", true)
             .build();
 
-        let udp_valve = gst::ElementFactory::make("valve").build().unwrap();
+        let udp_valve = gst::ElementFactory::make("valve")
+            .property("drop", true)
+            .build()
+            .unwrap();
 
         let udpsink = gst::ElementFactory::make("udpsink")
-            .property("sync", false)
             .property("port", 3000)
+            .property("async", false)
             .build()
             .unwrap();
 
@@ -199,8 +200,8 @@ impl MyStream {
                 &queue2,
                 &udp_valve,
                 &videoconvertscale2,
-                &vp9enc,
-                &vp9payloader,
+                &encoder,
+                &payloader,
                 &udpsink,
             ])
             .gst_pipeline();
@@ -245,24 +246,32 @@ impl Lobby {
         }
     }
 
+    fn view_clients(&self) -> Element<'_, LobbyMessage> {
+        column!("Clients").into()
+    }
+
+    fn view_my_stream(&self) -> Element<'_, LobbyMessage> {
+        container(match &self.my_stream {
+            Some(v) => Element::<LobbyMessage>::from(column!(
+                button("Stop Stream").on_press(LobbyMessage::StopStream),
+                v.stream.view().map(LobbyMessage::VideoStreamMessage),
+            )),
+            None => button("Start stream")
+                .on_press(LobbyMessage::StartStream)
+                .into(),
+        })
+        .width(Length::Fill)
+        .into()
+    }
+
     pub fn view(&self) -> Element<'_, LobbyMessage> {
-        container(column!(
+        column!(
             container(row!(
                 self.id.as_str(),
                 button("Leave").on_press(LobbyMessage::Leave)
             )),
-            match &self.my_stream {
-                Some(v) => {
-                    Element::<LobbyMessage>::from(column!(
-                        button("Stop Stream").on_press(LobbyMessage::StopStream),
-                        v.stream.view().map(LobbyMessage::VideoStreamMessage),
-                    ))
-                }
-                None => button("Start stream")
-                    .on_press(LobbyMessage::StartStream)
-                    .into(),
-            }
-        ))
+            row!(self.view_my_stream(), self.view_clients(),),
+        )
         .into()
     }
 

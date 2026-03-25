@@ -45,6 +45,7 @@ impl AsRef<[u8]> for SampleBytes {
 #[derive(Debug, Clone)]
 pub enum VideoMessage {
     Frame(bytes::Bytes, gst::Caps),
+    // todo: add error here
 }
 
 pub struct VideoPipeline {
