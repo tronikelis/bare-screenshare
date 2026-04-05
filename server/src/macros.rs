@@ -1,10 +1,9 @@
-macro_rules! clone_expr {
-    ($($var:ident),+ => $expr:expr) => {{
+macro_rules! shadowclone {
+    ($($var:ident),+) => {
         $(
             let $var = $var.clone();
         )+
-        $expr
-    }};
+    }
 }
 
-pub(crate) use clone_expr;
+pub(crate) use shadowclone;

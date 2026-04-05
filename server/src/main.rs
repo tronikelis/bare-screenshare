@@ -113,108 +113,128 @@ struct TcpSendReceive {
 }
 
 impl TcpSendReceive {
-    async fn new(host: &str, port: usize, accept_tx: mpsc::Sender<TcpSenderReceiver>) -> Self {
-        let sub_listener = TcpListener::bind(format!("{}:{}", host, port))
-            .await
-            .unwrap();
-        let rpc_listener = TcpListener::bind(format!("{}:{}", host, port + 1))
-            .await
-            .unwrap();
+    async fn new(
+        host: &str,
+        port: usize,
+        accept_tx: mpsc::Sender<TcpSenderReceiver>,
+    ) -> anyhow::Result<Self> {
+        let sub_listener = TcpListener::bind(format!("{}:{}", host, port)).await?;
+        let rpc_listener = TcpListener::bind(format!("{}:{}", host, port + 1)).await?;
 
-        Self {
+        Ok(Self {
             accept_tx,
             sub_listener,
             rpc_listener,
             id_map: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
-    async fn listen(&self) {
+    async fn listen(&self) -> anyhow::Result<()> {
         let sub_listener = async {
             loop {
-                let (mut stream, _) = self.sub_listener.accept().await.unwrap();
+                let (mut stream, _) = self.sub_listener.accept().await?;
                 let mut id: TcpId = [0; 32];
-                rand_bytes(&mut id).unwrap();
-                stream.write_all(&id).await.unwrap();
+                rand_bytes(&mut id)?;
+                stream.write_all(&id).await?;
                 self.id_map.lock().await.insert(id, stream);
             }
         };
 
         let rpc_listener = async {
             loop {
-                let (mut stream, _) = self.rpc_listener.accept().await.unwrap();
+                let (mut stream, _) = self.rpc_listener.accept().await?;
                 let id_map = self.id_map.clone();
                 let mut accept_tx = self.accept_tx.clone();
-                smol::spawn(async move {
+                smol::spawn::<anyhow::Result<()>>(async move {
                     let mut id: TcpId = [0; 32];
-                    stream.read_exact(&mut id).await.unwrap();
+                    stream.read_exact(&mut id).await?;
 
                     let mut id_map = id_map.lock().await;
                     if !id_map.contains_key(&id) {
-                        return;
+                        return Ok(());
                     }
-                    let sender = id_map.remove(&id).expect("map contained the key");
+                    let sender = id_map
+                        .remove(&id)
+                        .ok_or_else(|| anyhow::anyhow!("expected id to be in map"))?;
+                    accept_tx.send((id, sender, stream)).await?;
 
-                    accept_tx.send((id, sender, stream)).await.unwrap();
+                    Ok(())
                 })
                 .detach();
             }
         };
 
-        futures::join!(sub_listener, rpc_listener);
+        let (res1, res2): (anyhow::Result<()>, anyhow::Result<()>) =
+            futures::join!(sub_listener, rpc_listener);
+        res1?;
+        res2?;
+
+        Ok(())
     }
 }
 
-#[repr(u32)]
-enum RpcCode {
-    Unknown = 0,
-    JoinLobby = 1,
-    ReceiveLobbyClients = 2,
-}
-
-impl From<u32> for RpcCode {
-    fn from(value: u32) -> Self {
-        match value {
-            1 => Self::JoinLobby,
-            2 => Self::ReceiveLobbyClients,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct LobbyClientPayload {
-    udp_octets: [u8; 4],
-    udp_port: u16,
-    id: TcpId,
-}
-
-impl LobbyClientPayload {
-    fn new(id: TcpId, addr: SocketAddrV4) -> Self {
-        Self {
-            id,
-            udp_octets: addr.ip().octets(),
-            udp_port: addr.port(),
-        }
-    }
-}
-
+#[derive(Debug, Clone)]
 struct LobbyClient {
-    udp_addr: SocketAddrV4,
-    receiver: RpcConn<TcpStream>,
+    udp_addr: Option<SocketAddrV4>,
     id: TcpId,
 }
 
 impl LobbyClient {
-    fn new(id: TcpId, udp_addr: SocketAddrV4, receiver: RpcConn<TcpStream>) -> Self {
-        Self {
-            id,
-            udp_addr,
-            receiver,
-        }
+    fn new(id: TcpId, udp_addr: Option<SocketAddrV4>) -> Self {
+        Self { id, udp_addr }
     }
 }
 
+#[derive(Debug)]
+struct Lobbies {
+    map: HashMap<String, Lobby>,
+    tcp_id_to_lobby_id: HashMap<TcpId, String>,
+}
+
+impl Lobbies {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            tcp_id_to_lobby_id: HashMap::new(),
+        }
+    }
+
+    fn cleanup(&mut self, tcp_id: TcpId) {
+        let Some(lobby_id) = self.tcp_id_to_lobby_id.remove(&tcp_id) else {
+            return;
+        };
+        let Some(lobby) = self.map.get_mut(&lobby_id) else {
+            return;
+        };
+        lobby.remove_client(tcp_id);
+        if lobby.clients.len() == 0 {
+            self.map.remove(&lobby_id);
+        }
+    }
+
+    fn set_client_udp_address(&mut self, id: TcpId, address: SocketAddrV4) {
+        let Some(lobby_id) = self.tcp_id_to_lobby_id.get(&id) else {
+            return;
+        };
+        let Some(lobby) = self.map.get_mut(lobby_id) else {
+            return;
+        };
+        lobby.set_udp_address(id, address);
+    }
+
+    fn join(&mut self, id: String, client: LobbyClient) {
+        let mut new_lobby = Lobby::new(id.clone());
+        new_lobby.add_client(client.clone());
+
+        self.tcp_id_to_lobby_id.insert(client.id, id.clone());
+        self.map
+            .entry(id)
+            .and_modify(|v| v.add_client(client))
+            .or_insert(new_lobby);
+    }
+}
+
+#[derive(Debug)]
 struct Lobby {
     id: String,
     clients: Vec<LobbyClient>,
@@ -228,6 +248,15 @@ impl Lobby {
         }
     }
 
+    fn set_udp_address(&mut self, id: TcpId, address: SocketAddrV4) {
+        for client in self.clients.iter_mut() {
+            if client.id == id {
+                client.udp_addr = Some(address);
+                break;
+            }
+        }
+    }
+
     fn add_client(&mut self, client: LobbyClient) {
         self.remove_client(client.id);
         self.clients.push(client);
@@ -238,119 +267,159 @@ impl Lobby {
             self.clients.swap_remove(index);
         }
     }
+}
 
-    fn new_with_client(id: String, client: LobbyClient) -> Self {
-        let mut c = Self::new(id);
-        c.add_client(client);
-        c
-    }
+#[repr(u32)]
+enum RpcServerCode {
+    Unknown = 0,
+    JoinLobby = 1,
+}
 
-    async fn notify_lobby_clients(&mut self) -> io::Result<()> {
-        let peers = self
-            .clients
-            .iter()
-            .map(|v| (v.id, v.udp_addr))
-            .collect::<Vec<_>>();
-
-        let futures = self
-            .clients
-            .iter_mut()
-            .map(|client| async {
-                let payload = peers
-                    .iter()
-                    .filter(|v| v.0 != client.id)
-                    .map(|v| LobbyClientPayload::new(v.0, v.1))
-                    .collect::<Vec<_>>();
-                client
-                    .receiver
-                    .call(
-                        RpcCode::ReceiveLobbyClients as u32,
-                        serde_json::to_string(&payload)
-                            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-                            .as_bytes(),
-                    )
-                    .await
-            })
-            .collect::<Vec<_>>();
-
-        for result in futures::future::join_all(futures).await {
-            result?;
+impl From<u32> for RpcServerCode {
+    fn from(value: u32) -> Self {
+        match value {
+            1 => Self::JoinLobby,
+            _ => Self::Unknown,
         }
-
-        Ok(())
     }
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct JoinLobbyData {
+    id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct JoinLobbyRet {}
+
+#[derive(Debug, Clone)]
+struct RpcServer {
+    receivers: Arc<Mutex<HashMap<TcpId, RpcConn<TcpStream>>>>,
+    lobbies: Arc<Mutex<Lobbies>>,
+}
+
+#[derive(Debug)]
+struct RpcServerHandler {
+    id: TcpId,
+    server: RpcServer,
+    connection: RpcConn<TcpStream>,
+}
+
+impl RpcServerHandler {
+    async fn handle_join_lobby(&mut self, data: JoinLobbyData) -> anyhow::Result<JoinLobbyRet> {
+        self.server
+            .lobbies
+            .lock()
+            .await
+            .join(data.id, LobbyClient::new(self.id, None));
+        Ok(JoinLobbyRet {})
+    }
+
+    async fn listen(mut self) -> anyhow::Result<()> {
+        loop {
+            let (code, data) = self.connection.recv_call::<RpcServerCode>().await?;
+            let ret = match code {
+                RpcServerCode::Unknown => anyhow::bail!("unknown code"),
+                RpcServerCode::JoinLobby => serde_json::to_string(
+                    &self
+                        .handle_join_lobby(serde_json::from_slice(&data)?)
+                        .await?,
+                )?,
+            };
+            self.connection.recv_call_ret(ret.as_bytes()).await?;
+        }
+    }
+}
+
+impl Drop for RpcServerHandler {
+    fn drop(&mut self) {
+        let server = self.server.clone();
+        let id = self.id.clone();
+        smol::spawn(async move {
+            server.cleanup(id).await;
+        })
+        .detach();
+    }
+}
+
+impl RpcServer {
+    fn new() -> Self {
+        Self {
+            receivers: Arc::new(Mutex::new(HashMap::new())),
+            lobbies: Arc::new(Mutex::new(Lobbies::new())),
+        }
+    }
+
+    async fn listen_for_udp_addresses(&self) -> anyhow::Result<()> {
+        let socket = UdpSocket::bind("127.0.0.1:4000").await?;
+        loop {
+            let mut buf: TcpId = [0; 32];
+            let Ok((size, addr)) = socket.recv_from(&mut buf).await else {
+                continue;
+            };
+            if size != 32 {
+                println!("udp size not 32");
+                continue;
+            }
+            let SocketAddr::V4(v4) = addr else {
+                unreachable!();
+            };
+            self.lobbies.lock().await.set_client_udp_address(buf, v4);
+        }
+    }
+
+    async fn listen(&self) -> anyhow::Result<()> {
+        let (res1,) = futures::join!(self.listen_for_udp_addresses());
+        res1?;
+        Ok(())
+    }
+
+    async fn cleanup(&self, id: TcpId) {
+        self.receivers.lock().await.remove(&id);
+        self.lobbies.lock().await.cleanup(id);
+    }
+
+    async fn add_receiver(&self, id: TcpId, receiver: RpcConn<TcpStream>) {
+        self.receivers.lock().await.insert(id, receiver);
+    }
+
+    fn get_handler(&self, id: TcpId, connection: RpcConn<TcpStream>) -> RpcServerHandler {
+        RpcServerHandler {
+            server: self.clone(),
+            id,
+            connection,
+        }
+    }
+}
+
+async fn async_main() -> anyhow::Result<()> {
+    let rpc_server = RpcServer::new();
+
+    let (accept_tx, mut accept_rx) = mpsc::channel(8);
+    let tcp_send_receive = TcpSendReceive::new("127.0.0.1", 3000, accept_tx).await?;
+
+    let receive_fut = async {
+        loop {
+            let (tcp_id, sender, receiver) = accept_rx.recv().await?;
+            rpc_server.add_receiver(tcp_id, receiver.into()).await;
+            let handler = rpc_server.get_handler(tcp_id, sender.into());
+            smol::spawn(async move {
+                let _ = handler.listen().await;
+            })
+            .detach();
+        }
+    };
+
+    let (res1, res2, res3): (anyhow::Result<()>, anyhow::Result<()>, anyhow::Result<()>) =
+        futures::join!(tcp_send_receive.listen(), rpc_server.listen(), receive_fut,);
+
+    res1?;
+    res2?;
+    res3?;
+
+    Ok(())
+}
+
 fn main() {
-    smol::block_on(async {
-        let udp_addresses = Arc::new(Mutex::new(HashMap::<TcpId, SocketAddrV4>::new()));
-
-        let udp_listener = async {
-            let socket = UdpSocket::bind("127.0.0.1:4000").await.unwrap();
-            loop {
-                let mut buf: TcpId = [0; 32];
-                let (size, addr) = socket.recv_from(&mut buf).await.unwrap();
-                if size != 32 {
-                    println!("udp size not 32");
-                    continue;
-                }
-                let SocketAddr::V4(v4) = addr else {
-                    unreachable!();
-                };
-                udp_addresses.lock().await.insert(buf, v4);
-            }
-        };
-
-        let (accept_tx, mut accept_rx) = mpsc::channel(1);
-        let tcp_send_receive = TcpSendReceive::new("localhost", 3000, accept_tx).await;
-
-        let lobbies = Arc::new(Mutex::new(HashMap::<String, Lobby>::new()));
-
-        println!("started server");
-        futures::join!(udp_listener, tcp_send_receive.listen(), async {
-            loop {
-                let (id, sender, receiver) = accept_rx.recv().await.unwrap();
-                let mut sender: RpcConn<_> = sender.into();
-                let mut receiver: Option<RpcConn<_>> = Some(receiver.into());
-                println!("got connection");
-
-                let lobbies = lobbies.clone();
-                let udp_addresses = udp_addresses.clone();
-                smol::spawn(async move {
-                    loop {
-                        let (code, data) = sender.recv_call::<RpcCode>().await.unwrap();
-                        match code {
-                            RpcCode::JoinLobby => {
-                                let udp_address =
-                                    udp_addresses.lock().await.get(&id).map(|v| v.clone());
-                                let Some(udp_addr) = udp_address else {
-                                    panic!("joining lobby without establishing udp, todo fix");
-                                };
-
-                                let lobby_id = String::from_utf8(data).unwrap();
-                                let mut lobbies = lobbies.lock().await;
-                                let lobby = lobbies
-                                    .entry(lobby_id.clone())
-                                    .and_modify(|v| {
-                                        v.add_client(LobbyClient::new(
-                                            id,
-                                            udp_addr,
-                                            receiver.take().unwrap(),
-                                        ));
-                                    })
-                                    .or_insert(Lobby::new_with_client(
-                                        lobby_id.clone(),
-                                        LobbyClient::new(id, udp_addr, receiver.take().unwrap()),
-                                    ));
-                                sender.recv_call_ret(&[]).await.unwrap();
-                                lobby.notify_lobby_clients().await.unwrap();
-                            }
-                            RpcCode::Unknown | RpcCode::ReceiveLobbyClients => break,
-                        }
-                    }
-                })
-                .detach();
-            }
-        });
-    });
+    smol::block_on(async_main()).unwrap();
 }
