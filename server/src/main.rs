@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::HashMap,
     fs,
     io::{self, prelude::*},
@@ -6,8 +7,14 @@ use std::{
     sync::Arc,
 };
 
+type ArcMu<T> = Arc<Mutex<T>>;
+
+fn arcmu<T>(inner: T) -> ArcMu<T> {
+    Arc::new(Mutex::new(inner))
+}
+
 use futures::{channel::mpsc, prelude::*};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use smol::{
     io::{BufReader, BufWriter},
     lock::Mutex,
@@ -32,10 +39,21 @@ impl From<TcpStream> for RpcConn<TcpStream> {
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> RpcConn<T> {
-    async fn call<Code: Into<u32>>(&mut self, code: Code, data: &[u8]) -> io::Result<Vec<u8>> {
+    async fn call_raw<Code: Into<u32>>(&mut self, code: Code, data: &[u8]) -> io::Result<Vec<u8>> {
         self.send_code(code).await?;
         self.send_data(data).await?;
         self.recv_data().await
+    }
+
+    async fn call<Code: Into<u32>, S: Serialize, D: DeserializeOwned>(
+        &mut self,
+        code: Code,
+        data: S,
+    ) -> anyhow::Result<D> {
+        let ret = self
+            .call_raw(code, serde_json::to_string(&data)?.as_bytes())
+            .await?;
+        Ok(serde_json::from_slice(&ret)?)
     }
 
     async fn recv_call<Code: From<u32>>(&mut self) -> io::Result<(Code, Vec<u8>)> {
@@ -108,7 +126,7 @@ type TcpSenderReceiver = (TcpId, TcpStream, TcpStream);
 struct TcpSendReceive {
     sub_listener: TcpListener,
     rpc_listener: TcpListener,
-    id_map: Arc<Mutex<HashMap<TcpId, TcpStream>>>,
+    id_map: ArcMu<HashMap<TcpId, TcpStream>>,
     accept_tx: mpsc::Sender<TcpSenderReceiver>,
 }
 
@@ -125,11 +143,11 @@ impl TcpSendReceive {
             accept_tx,
             sub_listener,
             rpc_listener,
-            id_map: Arc::new(Mutex::new(HashMap::new())),
+            id_map: arcmu(HashMap::new()),
         })
     }
 
-    async fn listen(&self) -> anyhow::Result<()> {
+    async fn listen(self) -> anyhow::Result<()> {
         let sub_listener = async {
             loop {
                 let (mut stream, _) = self.sub_listener.accept().await?;
@@ -240,7 +258,7 @@ struct Lobby {
     clients: Vec<LobbyClient>,
 }
 
-impl From<&Lobby> for LobbyInfoData {
+impl From<&Lobby> for LobbyInfo {
     fn from(value: &Lobby) -> Self {
         Self {
             clients: value.clients.clone(),
@@ -278,17 +296,20 @@ impl Lobby {
 }
 
 #[repr(u32)]
-enum RpcClientCode {
+enum RpcNotifyCode {
     Unknown = 0,
     LobbyInfo = 1,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct LobbyInfoData {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LobbyInfo {
     clients: Vec<LobbyClient>,
 }
 
-impl LobbyInfoData {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct VoidRet {}
+
+impl LobbyInfo {
     fn excluding_client(mut self, id: TcpId) -> Self {
         let index = self.clients.iter().enumerate().find(|v| v.1.id == id);
         if let Some((index, _)) = index {
@@ -298,10 +319,7 @@ impl LobbyInfoData {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct LobbyInfoRet {}
-
-impl From<u32> for RpcClientCode {
+impl From<u32> for RpcNotifyCode {
     fn from(value: u32) -> Self {
         match value {
             1 => Self::LobbyInfo,
@@ -311,24 +329,20 @@ impl From<u32> for RpcClientCode {
 }
 
 #[derive(Debug)]
-struct RpcClient {
+struct RpcNotifyClient {
     connection: RpcConn<TcpStream>,
 }
 
-impl RpcClient {
+impl RpcNotifyClient {
     fn new(connection: RpcConn<TcpStream>) -> Self {
         Self { connection }
     }
 
-    async fn send_lobby_info(&mut self, data: LobbyInfoData) -> anyhow::Result<LobbyInfoRet> {
-        let ret = self
+    async fn send_lobby_info(&mut self, data: LobbyInfo) -> anyhow::Result<VoidRet> {
+        Ok(self
             .connection
-            .call(
-                RpcClientCode::LobbyInfo as u32,
-                serde_json::to_string(&data)?.as_bytes(),
-            )
-            .await?;
-        Ok(serde_json::from_slice(&ret)?)
+            .call(RpcNotifyCode::LobbyInfo as u32, data)
+            .await?)
     }
 }
 
@@ -355,10 +369,22 @@ struct JoinLobbyData {
 #[derive(Debug, Deserialize, Serialize)]
 struct JoinLobbyRet {}
 
+#[derive(Debug)]
+struct NotifyLobby {
+    tcp_id: TcpId,
+    lobby_info: LobbyInfo,
+}
+
+#[derive(Debug)]
+enum Notify {
+    Lobby(Vec<NotifyLobby>),
+    NewReceiver(TcpId, RpcNotifyClient),
+}
+
 #[derive(Debug, Clone)]
 struct RpcServer {
-    receivers: Arc<Mutex<HashMap<TcpId, RpcClient>>>,
-    lobbies: Arc<Mutex<Lobbies>>,
+    lobbies: ArcMu<Lobbies>,
+    notify_tx: mpsc::Sender<Notify>,
 }
 
 #[derive(Debug)]
@@ -369,14 +395,14 @@ struct RpcServerHandler {
 }
 
 impl RpcServerHandler {
-    async fn handle_join_lobby(&mut self, data: JoinLobbyData) -> anyhow::Result<JoinLobbyRet> {
+    async fn handle_join_lobby(&mut self, data: JoinLobbyData) -> anyhow::Result<VoidRet> {
         self.server
             .lobbies
             .lock()
             .await
             .join(data.id.clone(), LobbyClient::new(self.id, None));
         self.server.notify_lobby(&data.id).await?;
-        Ok(JoinLobbyRet {})
+        Ok(VoidRet {})
     }
 
     async fn listen(mut self) -> anyhow::Result<()> {
@@ -407,10 +433,10 @@ impl Drop for RpcServerHandler {
 }
 
 impl RpcServer {
-    fn new() -> Self {
+    fn new(notify_tx: mpsc::Sender<Notify>) -> Self {
         Self {
-            receivers: Arc::new(Mutex::new(HashMap::new())),
-            lobbies: Arc::new(Mutex::new(Lobbies::new())),
+            lobbies: arcmu(Lobbies::new()),
+            notify_tx,
         }
     }
 
@@ -433,56 +459,30 @@ impl RpcServer {
     }
 
     async fn listen(&self) -> anyhow::Result<()> {
-        let (res1,) = futures::join!(self.listen_for_udp_addresses());
-        res1?;
+        futures::try_join!(self.listen_for_udp_addresses())?;
         Ok(())
     }
 
     async fn cleanup(&self, id: TcpId) {
-        self.receivers.lock().await.remove(&id);
         self.lobbies.lock().await.cleanup(id);
     }
 
-    async fn add_receiver(&self, id: TcpId, receiver: RpcConn<TcpStream>) {
-        self.receivers
-            .lock()
-            .await
-            .insert(id, RpcClient::new(receiver));
-    }
-
-    async fn notify_lobby(&self, lobby_id: &str) -> anyhow::Result<()> {
+    async fn notify_lobby(&mut self, lobby_id: &str) -> anyhow::Result<()> {
         let lobbies = self.lobbies.lock().await;
         let Some(lobby) = lobbies.map.get(lobby_id) else {
             return Ok(());
         };
 
-        let mut receivers = self.receivers.lock().await;
-        let mut id_with_receivers = lobby
+        let notify_lobby = lobby
             .clients
             .iter()
-            .map(|v| Some((v.id, receivers.remove(&v.id)?)))
-            .collect::<Vec<_>>();
-
-        let futures = id_with_receivers
-            .iter_mut()
-            .map(|v| async {
-                let Some((id, receiver)) = v else {
-                    return;
-                };
-                let _ = receiver
-                    .send_lobby_info(LobbyInfoData::from(lobby).excluding_client(*id))
-                    .await;
+            .map(|client| NotifyLobby {
+                tcp_id: client.id,
+                lobby_info: LobbyInfo::from(lobby).excluding_client(client.id),
             })
             .collect::<Vec<_>>();
 
-        futures::future::join_all(futures).await;
-
-        for v in id_with_receivers {
-            if let Some((id, receiver)) = v {
-                receivers.insert(id, receiver);
-            }
-        }
-
+        self.notify_tx.send(Notify::Lobby(notify_lobby)).await?;
         Ok(())
     }
 
@@ -495,17 +495,77 @@ impl RpcServer {
     }
 }
 
+struct Notifier {
+    receivers: HashMap<TcpId, RefCell<RpcNotifyClient>>,
+    notify_rx: mpsc::Receiver<Notify>,
+}
+
+impl Notifier {
+    fn new(notify_rx: mpsc::Receiver<Notify>) -> Self {
+        Self {
+            receivers: HashMap::new(),
+            notify_rx,
+        }
+    }
+
+    async fn notify_lobby(&self, lobbies: Vec<NotifyLobby>) -> anyhow::Result<()> {
+        let futures = lobbies
+            .iter()
+            .map(|v| async {
+                let Some(receiver) = self.receivers.get(&v.tcp_id) else {
+                    return Result::<(), anyhow::Error>::Ok(());
+                };
+                let _ = receiver
+                    .borrow_mut()
+                    .send_lobby_info(v.lobby_info.clone())
+                    .await?;
+                Ok(())
+            })
+            .collect::<Vec<_>>();
+
+        for fut in futures::future::join_all(futures).await {
+            fut?;
+        }
+        Ok(())
+    }
+
+    async fn listen(mut self) -> anyhow::Result<()> {
+        loop {
+            let notify = self.notify_rx.recv().await?;
+            match notify {
+                Notify::Lobby(v) => self.notify_lobby(v).await?,
+                Notify::NewReceiver(id, v) => {
+                    self.receivers.insert(id, RefCell::new(v));
+                }
+            };
+        }
+    }
+}
+
 async fn async_main() -> anyhow::Result<()> {
-    let rpc_server = RpcServer::new();
+    let (mut notify_tx, notify_rx) = mpsc::channel(8);
+
+    let rpc_server = RpcServer::new(notify_tx.clone());
+    let notifier = Notifier::new(notify_rx);
 
     let (accept_tx, mut accept_rx) = mpsc::channel(8);
     let tcp_send_receive = TcpSendReceive::new("127.0.0.1", 3000, accept_tx).await?;
 
-    let receive_fut = async {
+    let handler_fut = async {
         loop {
-            let (tcp_id, sender, receiver) = accept_rx.recv().await?;
-            rpc_server.add_receiver(tcp_id, receiver.into()).await;
+            let (tcp_id, sender, receiver) = match accept_rx.recv().await {
+                Ok(v) => v,
+                Err(v) => anyhow::bail!(v),
+            };
+
+            notify_tx
+                .send(Notify::NewReceiver(
+                    tcp_id,
+                    RpcNotifyClient::new(receiver.into()),
+                ))
+                .await?;
             let handler = rpc_server.get_handler(tcp_id, sender.into());
+
             smol::spawn(async move {
                 let _ = handler.listen().await;
             })
@@ -513,12 +573,12 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
 
-    let (res1, res2, res3): (anyhow::Result<()>, anyhow::Result<()>, anyhow::Result<()>) =
-        futures::join!(tcp_send_receive.listen(), rpc_server.listen(), receive_fut,);
-
-    res1?;
-    res2?;
-    res3?;
+    let (_, _, _, _): ((), (), (), ()) = futures::try_join!(
+        tcp_send_receive.listen(),
+        rpc_server.listen(),
+        notifier.listen(),
+        handler_fut,
+    )?;
 
     Ok(())
 }
