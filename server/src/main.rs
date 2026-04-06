@@ -173,7 +173,7 @@ impl TcpSendReceive {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LobbyClient {
     udp_addr: Option<SocketAddrV4>,
     id: TcpId,
@@ -240,6 +240,14 @@ struct Lobby {
     clients: Vec<LobbyClient>,
 }
 
+impl From<&Lobby> for LobbyInfoData {
+    fn from(value: &Lobby) -> Self {
+        Self {
+            clients: value.clients.clone(),
+        }
+    }
+}
+
 impl Lobby {
     fn new(id: String) -> Self {
         Self {
@@ -270,6 +278,61 @@ impl Lobby {
 }
 
 #[repr(u32)]
+enum RpcClientCode {
+    Unknown = 0,
+    LobbyInfo = 1,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LobbyInfoData {
+    clients: Vec<LobbyClient>,
+}
+
+impl LobbyInfoData {
+    fn excluding_client(mut self, id: TcpId) -> Self {
+        let index = self.clients.iter().enumerate().find(|v| v.1.id == id);
+        if let Some((index, _)) = index {
+            self.clients.swap_remove(index);
+        }
+        self
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LobbyInfoRet {}
+
+impl From<u32> for RpcClientCode {
+    fn from(value: u32) -> Self {
+        match value {
+            1 => Self::LobbyInfo,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RpcClient {
+    connection: RpcConn<TcpStream>,
+}
+
+impl RpcClient {
+    fn new(connection: RpcConn<TcpStream>) -> Self {
+        Self { connection }
+    }
+
+    async fn send_lobby_info(&mut self, data: LobbyInfoData) -> anyhow::Result<LobbyInfoRet> {
+        let ret = self
+            .connection
+            .call(
+                RpcClientCode::LobbyInfo as u32,
+                serde_json::to_string(&data)?.as_bytes(),
+            )
+            .await?;
+        Ok(serde_json::from_slice(&ret)?)
+    }
+}
+
+#[repr(u32)]
 enum RpcServerCode {
     Unknown = 0,
     JoinLobby = 1,
@@ -294,7 +357,7 @@ struct JoinLobbyRet {}
 
 #[derive(Debug, Clone)]
 struct RpcServer {
-    receivers: Arc<Mutex<HashMap<TcpId, RpcConn<TcpStream>>>>,
+    receivers: Arc<Mutex<HashMap<TcpId, RpcClient>>>,
     lobbies: Arc<Mutex<Lobbies>>,
 }
 
@@ -311,7 +374,8 @@ impl RpcServerHandler {
             .lobbies
             .lock()
             .await
-            .join(data.id, LobbyClient::new(self.id, None));
+            .join(data.id.clone(), LobbyClient::new(self.id, None));
+        self.server.notify_lobby(&data.id).await?;
         Ok(JoinLobbyRet {})
     }
 
@@ -380,7 +444,46 @@ impl RpcServer {
     }
 
     async fn add_receiver(&self, id: TcpId, receiver: RpcConn<TcpStream>) {
-        self.receivers.lock().await.insert(id, receiver);
+        self.receivers
+            .lock()
+            .await
+            .insert(id, RpcClient::new(receiver));
+    }
+
+    async fn notify_lobby(&self, lobby_id: &str) -> anyhow::Result<()> {
+        let lobbies = self.lobbies.lock().await;
+        let Some(lobby) = lobbies.map.get(lobby_id) else {
+            return Ok(());
+        };
+
+        let mut receivers = self.receivers.lock().await;
+        let mut id_with_receivers = lobby
+            .clients
+            .iter()
+            .map(|v| Some((v.id, receivers.remove(&v.id)?)))
+            .collect::<Vec<_>>();
+
+        let futures = id_with_receivers
+            .iter_mut()
+            .map(|v| async {
+                let Some((id, receiver)) = v else {
+                    return;
+                };
+                let _ = receiver
+                    .send_lobby_info(LobbyInfoData::from(lobby).excluding_client(*id))
+                    .await;
+            })
+            .collect::<Vec<_>>();
+
+        futures::future::join_all(futures).await;
+
+        for v in id_with_receivers {
+            if let Some((id, receiver)) = v {
+                receivers.insert(id, receiver);
+            }
+        }
+
+        Ok(())
     }
 
     fn get_handler(&self, id: TcpId, connection: RpcConn<TcpStream>) -> RpcServerHandler {
