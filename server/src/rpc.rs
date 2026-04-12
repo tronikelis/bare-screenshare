@@ -31,7 +31,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin> RpcConn<T> {
         self.recv_data().await
     }
 
-    pub async fn call<Code: Into<u32>, S: Serialize, D: DeserializeOwned>(
+    async fn call<Code: Into<u32>, S: Serialize, D: DeserializeOwned>(
         &mut self,
         code: Code,
         data: S,
@@ -42,14 +42,16 @@ impl<T: AsyncRead + AsyncWrite + Unpin> RpcConn<T> {
         Ok(serde_json::from_slice(&ret)?)
     }
 
-    pub async fn recv_call<Code: From<u32>>(&mut self) -> io::Result<(Code, Vec<u8>)> {
+    async fn recv_call<Code: From<u32>>(&mut self) -> io::Result<(Code, Vec<u8>)> {
         let code = self.recv_code::<Code>().await?;
         let data = self.recv_data().await?;
         Ok((code, data))
     }
 
-    pub async fn recv_call_ret(&mut self, data: &[u8]) -> io::Result<()> {
-        self.send_data(data).await
+    async fn recv_call_ret<S: Serialize>(&mut self, data: S) -> anyhow::Result<()> {
+        Ok(self
+            .send_data(serde_json::to_string(&data)?.as_bytes())
+            .await?)
     }
 
     async fn recv_data(&mut self) -> io::Result<Vec<u8>> {
@@ -134,6 +136,51 @@ pub struct JoinLobbyData {
 }
 
 #[derive(Debug)]
+pub struct RpcUserClient {
+    connection: RpcConn<TcpStream>,
+}
+
+impl RpcUserClient {
+    pub fn new(connection: RpcConn<TcpStream>) -> Self {
+        Self { connection }
+    }
+
+    pub async fn join_lobby(&mut self, data: JoinLobbyData) -> anyhow::Result<VoidRet> {
+        Ok(self
+            .connection
+            .call(RpcCode::JoinLobby as u32, data)
+            .await?)
+    }
+}
+
+#[derive(Debug)]
+pub struct RpcUserNotifyClient {
+    connection: RpcConn<TcpStream>,
+}
+
+impl RpcUserNotifyClient {
+    pub fn new(connection: RpcConn<TcpStream>) -> Self {
+        Self { connection }
+    }
+
+    pub fn stream(self) -> impl TryStream<Item = anyhow::Result<state::LobbyInfoData>> {
+        futures::stream::try_unfold(self, |mut v| async {
+            let (code, data) = v.connection.recv_call::<RpcNotifyCode>().await?;
+            match code {
+                RpcNotifyCode::Unknown => anyhow::bail!("unknown code"),
+                RpcNotifyCode::LobbyInfo => {
+                    v.connection.recv_call_ret(VoidRet {}).await?;
+                    Ok(Some((
+                        serde_json::from_slice::<state::LobbyInfoData>(&data)?,
+                        v,
+                    )))
+                }
+            }
+        })
+    }
+}
+
+#[derive(Debug)]
 pub struct RpcServerHandler {
     id: TcpId,
     server: RpcServer,
@@ -154,15 +201,15 @@ impl RpcServerHandler {
     pub async fn listen(mut self) -> anyhow::Result<()> {
         loop {
             let (code, data) = self.connection.recv_call::<RpcCode>().await?;
-            let ret = match code {
+            match code {
                 RpcCode::Unknown => anyhow::bail!("unknown code"),
-                RpcCode::JoinLobby => serde_json::to_string(
-                    &self
+                RpcCode::JoinLobby => {
+                    let ret = self
                         .handle_join_lobby(serde_json::from_slice(&data)?)
-                        .await?,
-                )?,
+                        .await?;
+                    self.connection.recv_call_ret(ret).await?;
+                }
             };
-            self.connection.recv_call_ret(ret.as_bytes()).await?;
         }
     }
 }
