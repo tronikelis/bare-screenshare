@@ -3,8 +3,9 @@ use std::{
     collections::HashMap,
     fs,
     io::{self, prelude::*},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{SocketAddr, SocketAddrV4},
     sync::Arc,
+    time,
 };
 
 type ArcMu<T> = Arc<Mutex<T>>;
@@ -20,8 +21,6 @@ use smol::{
     lock::Mutex,
     net::{TcpListener, TcpStream, UdpSocket},
 };
-
-mod macros;
 
 #[derive(Debug)]
 struct RpcConn<T: AsyncRead + AsyncWrite> {
@@ -83,17 +82,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> RpcConn<T> {
 
     async fn write_len(&mut self, len: u32) -> io::Result<()> {
         self.writer.write_all(&len.to_le_bytes()).await
-    }
-
-    async fn recv_data_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-        let len = self.read_len().await?;
-        if len != buf.len() as u32 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "recv_exact incorrect len",
-            ));
-        }
-        self.reader.read_exact(buf).await
     }
 
     async fn send_code<Code: Into<u32>>(&mut self, code: Code) -> io::Result<()> {
@@ -366,9 +354,6 @@ struct JoinLobbyData {
     id: String,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-struct JoinLobbyRet {}
-
 #[derive(Debug)]
 struct NotifyLobby {
     tcp_id: TcpId,
@@ -496,7 +481,7 @@ impl RpcServer {
 }
 
 struct Notifier {
-    receivers: HashMap<TcpId, RefCell<RpcNotifyClient>>,
+    receivers: HashMap<TcpId, RefCell<Option<RpcNotifyClient>>>,
     notify_rx: mpsc::Receiver<Notify>,
 }
 
@@ -515,10 +500,16 @@ impl Notifier {
                 let Some(receiver) = self.receivers.get(&v.tcp_id) else {
                     return Result::<(), anyhow::Error>::Ok(());
                 };
-                let _ = receiver
-                    .borrow_mut()
-                    .send_lobby_info(v.lobby_info.clone())
-                    .await?;
+                let mut should_remove = false;
+                if let Some(receiver) = receiver.borrow_mut().as_mut() {
+                    should_remove = receiver
+                        .send_lobby_info(v.lobby_info.clone())
+                        .await
+                        .is_err();
+                }
+                if should_remove {
+                    *receiver.borrow_mut() = None;
+                }
                 Ok(())
             })
             .collect::<Vec<_>>();
@@ -529,15 +520,26 @@ impl Notifier {
         Ok(())
     }
 
+    fn cleanup(&mut self) {
+        self.receivers.retain(|_, v| v.borrow().is_some());
+    }
+
     async fn listen(mut self) -> anyhow::Result<()> {
+        let mut cleanup_timer =
+            futures::FutureExt::fuse(smol::Timer::interval(time::Duration::from_secs(1)));
         loop {
-            let notify = self.notify_rx.recv().await?;
-            match notify {
-                Notify::Lobby(v) => self.notify_lobby(v).await?,
-                Notify::NewReceiver(id, v) => {
-                    self.receivers.insert(id, RefCell::new(v));
+            futures::select_biased! {
+                notify_res = self.notify_rx.recv() => match notify_res? {
+                    Notify::Lobby(v) => self.notify_lobby(v).await?,
+                    Notify::NewReceiver(id, v) => {
+                        self.receivers.insert(id, RefCell::new(Some(v)));
+                    }
+                },
+                _ = cleanup_timer => {
+                    cleanup_timer = futures::FutureExt::fuse(smol::Timer::interval(time::Duration::from_secs(1)));
+                    self.cleanup();
                 }
-            };
+            }
         }
     }
 }
@@ -573,6 +575,7 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
 
+    println!("started listening");
     let (_, _, _, _): ((), (), (), ()) = futures::try_join!(
         tcp_send_receive.listen(),
         rpc_server.listen(),
