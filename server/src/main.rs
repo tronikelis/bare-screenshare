@@ -1,15 +1,15 @@
 use futures::{channel::mpsc, prelude::*};
 
-use server::*;
+use server::{conn, rpc};
 
 async fn async_main() -> anyhow::Result<()> {
     let (mut notify_tx, notify_rx) = mpsc::channel(8);
 
-    let rpc_server = RpcServer::new(notify_tx.clone());
-    let notifier = Notifier::new(notify_rx);
+    let rpc_server = rpc::RpcServer::new(notify_tx.clone());
+    let notifier = rpc::Notifier::new(notify_rx);
 
     let (accept_tx, mut accept_rx) = mpsc::channel(8);
-    let tcp_send_receive = TcpSendReceive::new("127.0.0.1", 3000, accept_tx).await?;
+    let tcp_send_receive = conn::TcpSendReceive::new("127.0.0.1", 3000, accept_tx).await?;
 
     let handler_fut = async {
         loop {
@@ -19,9 +19,9 @@ async fn async_main() -> anyhow::Result<()> {
             };
 
             notify_tx
-                .send(Notify::NewReceiver(
+                .send(rpc::Notify::NewReceiver(
                     tcp_id,
-                    RpcNotifyClient::new(receiver.into()),
+                    rpc::RpcNotifyClient::new(receiver.into()),
                 ))
                 .await?;
             let handler = rpc_server.get_handler(tcp_id, sender.into());
