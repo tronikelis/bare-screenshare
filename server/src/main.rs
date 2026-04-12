@@ -525,8 +525,9 @@ impl Notifier {
     }
 
     async fn listen(mut self) -> anyhow::Result<()> {
-        let mut cleanup_timer =
-            futures::FutureExt::fuse(smol::Timer::interval(time::Duration::from_secs(1)));
+        let new_cleanup_timer =
+            || futures::FutureExt::fuse(smol::Timer::interval(time::Duration::from_secs(1)));
+        let mut cleanup_timer = new_cleanup_timer();
         loop {
             futures::select_biased! {
                 notify_res = self.notify_rx.recv() => match notify_res? {
@@ -536,7 +537,7 @@ impl Notifier {
                     }
                 },
                 _ = cleanup_timer => {
-                    cleanup_timer = futures::FutureExt::fuse(smol::Timer::interval(time::Duration::from_secs(1)));
+                    cleanup_timer = new_cleanup_timer();
                     self.cleanup();
                 }
             }
