@@ -8,7 +8,7 @@ use futures::{channel::mpsc, prelude::*};
 use smol::net::{TcpListener, TcpStream};
 
 fn rand_bytes(buf: &mut [u8]) -> io::Result<()> {
-    let mut dev_random = fs::File::open("/dev/urandom")?;
+    let mut dev_random = fs::File::open("/dev/random")?;
     dev_random.read_exact(buf)
 }
 
@@ -67,6 +67,8 @@ impl TcpSendReceive {
                     let sender = id_map
                         .remove(&id)
                         .ok_or_else(|| anyhow::anyhow!("expected id to be in map"))?;
+
+                    stream.write_all(b"ok").await?;
                     accept_tx.send((id, sender, stream)).await?;
 
                     Ok(())
@@ -81,5 +83,34 @@ impl TcpSendReceive {
         res2?;
 
         Ok(())
+    }
+}
+
+pub struct TcpSendReceiveClient {
+    host: String,
+    port: usize,
+}
+
+impl TcpSendReceiveClient {
+    pub fn new(host: String, port: usize) -> Self {
+        Self { host, port }
+    }
+
+    pub async fn create(&self) -> anyhow::Result<TcpSenderReceiver> {
+        let mut id: TcpId = [0; 32];
+
+        let mut sender = TcpStream::connect(format!("{}:{}", &self.host, self.port)).await?;
+        let mut receiver = TcpStream::connect(format!("{}:{}", &self.host, self.port + 1)).await?;
+
+        sender.read_exact(&mut id).await?;
+        receiver.write_all(&id).await?;
+        let mut ok: [u8; 2] = [0; 2];
+        receiver.read_exact(&mut ok).await?;
+
+        if ok != *b"ok" {
+            anyhow::bail!("receiver not ok");
+        }
+
+        Ok((id, sender, receiver))
     }
 }
