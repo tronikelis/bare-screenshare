@@ -1,6 +1,5 @@
-use std::sync::Arc;
-
 use smol::lock::Mutex;
+use std::sync::Arc;
 
 pub mod conn;
 pub mod rpc;

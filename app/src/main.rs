@@ -1,10 +1,16 @@
 use iced::{Element, Task};
+use std::{cell::LazyCell, sync::LazyLock};
+
+use server::conn::TcpSendReceiveClient;
 
 mod dbus;
 mod macros;
 mod pipeline;
 mod ui;
 mod video;
+
+pub static TPC_SEND_RECEIVE_CLIENT: LazyLock<TcpSendReceiveClient> =
+    LazyLock::new(|| TcpSendReceiveClient::new("localhost".to_string(), 3000));
 
 struct App {
     screen: ui::Screen,
@@ -28,8 +34,11 @@ impl App {
         match message {
             ui::Message::MainMenuMessage(v) => match v {
                 ui::MainMenuMessage::CreateLobby => {
-                    self.screen = ui::Screen::Lobby(ui::Lobby::new(String::from("foo-bar")));
-                    Task::none()
+                    let (lobby, task) = smol::block_on(async {
+                        ui::Lobby::new("foo-bar".to_string()).await.unwrap()
+                    });
+                    self.screen = ui::Screen::Lobby(lobby);
+                    task.map(ui::Message::LobbyMessage)
                 }
             },
             ui::Message::LobbyMessage(v) => match v {

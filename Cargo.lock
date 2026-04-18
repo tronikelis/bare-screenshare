@@ -108,6 +108,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "app"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bytes",
  "futures",
  "gio",
@@ -116,6 +117,8 @@ dependencies = [
  "gstreamer-app",
  "iced",
  "rand",
+ "server",
+ "smol",
 ]
 
 [[package]]
@@ -1686,6 +1689,7 @@ dependencies = [
  "iced_core",
  "log",
  "rustc-hash 2.1.1",
+ "smol",
  "wasm-bindgen-futures",
  "wasmtimer",
 ]

@@ -17,6 +17,7 @@ async fn async_main() -> anyhow::Result<()> {
                 Ok(v) => v,
                 Err(v) => anyhow::bail!(v),
             };
+            println!("accepted conn: {:?}", tcp_id);
 
             notify_tx
                 .send(rpc::Notify::NewReceiver(
@@ -27,7 +28,12 @@ async fn async_main() -> anyhow::Result<()> {
             let handler = rpc_server.get_handler(tcp_id, sender.into());
 
             smol::spawn(async move {
-                let _ = handler.listen().await;
+                match handler.listen().await {
+                    Err(e) => {
+                        println!("handler failed: {}", e);
+                    }
+                    Ok(_) => {}
+                }
             })
             .detach();
         }

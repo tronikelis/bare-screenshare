@@ -12,8 +12,13 @@ use iced::{
     task,
     widget::{button, column, container, image, row},
 };
+use smol::net::UdpSocket;
 
 use crate::{dbus, macros, pipeline, video};
+use server::{
+    rpc::{JoinLobbyData, RpcUserClient, RpcUserNotifyClient, create_user_udp_socket},
+    state::LobbyInfoData,
+};
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -228,6 +233,8 @@ impl MyStream {
 pub struct Lobby {
     id: String,
     my_stream: Option<MyStream>,
+    rpc_client: RpcUserClient,
+    udp_socket: UdpSocket,
 }
 
 #[derive(Debug, Clone)]
@@ -236,14 +243,34 @@ pub enum LobbyMessage {
     StopStream,
     Leave,
     VideoStreamMessage(VideoStreamMessage),
+    RpcNotify(Result<LobbyInfoData, String>),
 }
 
 impl Lobby {
-    pub fn new(id: String) -> Self {
-        Self {
-            id,
-            my_stream: None,
-        }
+    pub async fn new(id: String) -> anyhow::Result<(Self, Task<LobbyMessage>)> {
+        let (tcp_id, sender, receiver) = crate::TPC_SEND_RECEIVE_CLIENT.create().await?;
+
+        let notify_stream = RpcUserNotifyClient::new(receiver.into()).stream();
+
+        let task = Task::stream(notify_stream)
+            .map(|v| LobbyMessage::RpcNotify(v.map_err(|e| e.to_string())));
+
+        let mut rpc_client = RpcUserClient::new(sender.into());
+        rpc_client
+            .join_lobby(JoinLobbyData { id: id.clone() })
+            .await?;
+
+        let udp_socket = create_user_udp_socket(&tcp_id).await?;
+
+        Ok((
+            Self {
+                id,
+                rpc_client,
+                udp_socket,
+                my_stream: None,
+            },
+            task,
+        ))
     }
 
     fn view_clients(&self) -> Element<'_, LobbyMessage> {
@@ -293,6 +320,17 @@ impl Lobby {
                 self.my_stream = None;
                 Task::none()
             }
+            LobbyMessage::RpcNotify(v) => match v {
+                Ok(v) => {
+                    println!("got message: {v:#?}");
+                    Task::none()
+                }
+                Err(e) => {
+                    // todo: retry connection
+                    println!("rpc notify failed: {e}");
+                    Task::none()
+                }
+            },
             LobbyMessage::Leave => unreachable!("should be handled above"),
         }
     }

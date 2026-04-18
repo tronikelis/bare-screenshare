@@ -43,14 +43,11 @@ impl Lobbies {
         }
     }
 
-    pub fn set_client_udp_address(&mut self, id: TcpId, address: SocketAddrV4) {
-        let Some(lobby_id) = self.tcp_id_to_lobby_id.get(&id) else {
-            return;
-        };
-        let Some(lobby) = self.map.get_mut(lobby_id) else {
-            return;
-        };
+    pub fn set_client_udp_address(&mut self, id: TcpId, address: SocketAddrV4) -> Option<String> {
+        let lobby_id = self.tcp_id_to_lobby_id.get(&id)?;
+        let lobby = self.map.get_mut(lobby_id)?;
         lobby.set_udp_address(id, address);
+        Some(lobby_id.clone())
     }
 
     pub fn join(&mut self, id: String, client: LobbyClient) {
@@ -69,14 +66,6 @@ impl Lobbies {
 pub struct Lobby {
     pub id: String,
     pub clients: Vec<LobbyClient>,
-}
-
-impl From<&Lobby> for LobbyInfoData {
-    fn from(value: &Lobby) -> Self {
-        Self {
-            clients: value.clients.clone(),
-        }
-    }
 }
 
 impl Lobby {
@@ -114,6 +103,14 @@ pub struct LobbyInfoData {
 }
 
 impl LobbyInfoData {
+    pub fn new(clients: Vec<LobbyClient>) -> Self {
+        Self { clients }
+    }
+
+    pub fn from_lobby(lobby: &Lobby) -> Self {
+        Self::new(lobby.clients.clone())
+    }
+
     pub fn excluding_client(mut self, id: TcpId) -> Self {
         let index = self.clients.iter().enumerate().find(|v| v.1.id == id);
         if let Some((index, _)) = index {

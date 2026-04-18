@@ -132,7 +132,7 @@ pub struct RpcServer {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct JoinLobbyData {
-    id: String,
+    pub id: String,
 }
 
 #[derive(Debug)]
@@ -199,6 +199,7 @@ impl RpcServerHandler {
     }
 
     pub async fn listen(mut self) -> anyhow::Result<()> {
+        println!("handler.listen");
         loop {
             let (code, data) = self.connection.recv_call::<RpcCode>().await?;
             match code {
@@ -225,6 +226,13 @@ impl Drop for RpcServerHandler {
     }
 }
 
+pub async fn create_user_udp_socket(id: &TcpId) -> anyhow::Result<UdpSocket> {
+    let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    socket.connect("127.0.0.1:4000").await?;
+    socket.send(id).await?;
+    Ok(socket)
+}
+
 impl RpcServer {
     pub fn new(notify_tx: mpsc::Sender<Notify>) -> Self {
         Self {
@@ -247,7 +255,13 @@ impl RpcServer {
             let SocketAddr::V4(v4) = addr else {
                 unreachable!();
             };
-            self.lobbies.lock().await.set_client_udp_address(buf, v4);
+            println!("got udp message: {buf:?}");
+            let lobby_id = self.lobbies.lock().await.set_client_udp_address(buf, v4);
+            if let Some(lobby_id) = lobby_id {
+                self.notify_lobby(&lobby_id).await?;
+            } else {
+                println!("warn: udp connection init without lobby");
+            }
         }
     }
 
@@ -260,7 +274,9 @@ impl RpcServer {
         self.lobbies.lock().await.cleanup(id);
     }
 
-    async fn notify_lobby(&mut self, lobby_id: &str) -> anyhow::Result<()> {
+    async fn notify_lobby(&self, lobby_id: &str) -> anyhow::Result<()> {
+        println!("notifying lobby \"{lobby_id}\"");
+
         let lobbies = self.lobbies.lock().await;
         let Some(lobby) = lobbies.map.get(lobby_id) else {
             return Ok(());
@@ -271,11 +287,14 @@ impl RpcServer {
             .iter()
             .map(|client| NotifyLobby {
                 tcp_id: client.id,
-                lobby_info: state::LobbyInfoData::from(lobby).excluding_client(client.id),
+                lobby_info: state::LobbyInfoData::from_lobby(lobby).excluding_client(client.id),
             })
             .collect::<Vec<_>>();
 
-        self.notify_tx.send(Notify::Lobby(notify_lobby)).await?;
+        self.notify_tx
+            .clone()
+            .send(Notify::Lobby(notify_lobby))
+            .await?;
         Ok(())
     }
 
