@@ -23,9 +23,7 @@ fn call_request_proxy_signal(
             let main_loop = glib::MainLoop::new(Some(&context), false);
 
             let handle_token = make_dbus_handle_token();
-            let unique_name = DBusConnection::from(dbus.clone())
-                .xdg_unique_name()
-                .unwrap();
+            let unique_name = DBusConnection::new(dbus.clone()).xdg_unique_name().unwrap();
 
             let proxy = gio::DBusProxy::new_sync(
                 dbus,
@@ -125,6 +123,10 @@ pub struct ScreenCastProxy {
 struct DBusConnection(gio::DBusConnection);
 
 impl DBusConnection {
+    fn new(inner: gio::DBusConnection) -> Self {
+        Self(inner)
+    }
+
     fn xdg_unique_name(&self) -> Option<String> {
         Some(
             self.0
@@ -133,12 +135,6 @@ impl DBusConnection {
                 .trim_start_matches(':')
                 .replace(".", "_"),
         )
-    }
-}
-
-impl From<gio::DBusConnection> for DBusConnection {
-    fn from(value: gio::DBusConnection) -> Self {
-        Self(value)
     }
 }
 

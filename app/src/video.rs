@@ -16,8 +16,8 @@ struct SampleBytes {
     memory: gst::MappedMemory<gst::memory::Readable>,
 }
 
-impl From<gst::Sample> for SampleBytes {
-    fn from(value: gst::Sample) -> Self {
+impl SampleBytes {
+    fn from_gst_sample(value: &gst::Sample) -> Self {
         Self {
             memory: value
                 .buffer()
@@ -28,11 +28,9 @@ impl From<gst::Sample> for SampleBytes {
                 .unwrap(),
         }
     }
-}
 
-impl From<SampleBytes> for bytes::Bytes {
-    fn from(value: SampleBytes) -> Self {
-        Self::from_owner(value)
+    fn into_bytes(self) -> bytes::Bytes {
+        bytes::Bytes::from_owner(self)
     }
 }
 
@@ -65,9 +63,9 @@ impl VideoPipeline {
             true,
             glib::closure!(move |sink: &gst_app::AppSink| {
                 let mut message_tx = message_tx_mu.lock().unwrap();
-                let sample_bytes: SampleBytes = sink.pull_sample().unwrap().into();
+                let sample_bytes = SampleBytes::from_gst_sample(&sink.pull_sample().unwrap());
                 let caps = sink.pads()[0].current_caps().unwrap();
-                let _ = message_tx.try_send(VideoMessage::Frame(sample_bytes.into(), caps));
+                let _ = message_tx.try_send(VideoMessage::Frame(sample_bytes.into_bytes(), caps));
                 gst::FlowReturn::Ok
             }),
         );

@@ -16,7 +16,7 @@ use smol::net::UdpSocket;
 
 use crate::{dbus, macros, pipeline, video};
 use server::{
-    rpc::{JoinLobbyData, RpcUserClient, RpcUserNotifyClient, create_user_udp_socket},
+    rpc::{JoinLobbyData, RpcUserClient, create_user_udp_socket, rpc_user_notify_stream},
     state::LobbyInfoData,
 };
 
@@ -250,7 +250,7 @@ impl Lobby {
     pub async fn new(id: String) -> anyhow::Result<(Self, Task<LobbyMessage>)> {
         let (tcp_id, sender, receiver) = crate::TPC_SEND_RECEIVE_CLIENT.create().await?;
 
-        let notify_stream = RpcUserNotifyClient::new(receiver.into()).stream();
+        let notify_stream = rpc_user_notify_stream(receiver.into());
 
         let task = Task::stream(notify_stream)
             .map(|v| LobbyMessage::RpcNotify(v.map_err(|e| e.to_string())));

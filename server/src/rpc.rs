@@ -17,14 +17,24 @@ pub struct RpcConn<T: AsyncRead + AsyncWrite> {
 
 impl From<TcpStream> for RpcConn<TcpStream> {
     fn from(value: TcpStream) -> Self {
-        RpcConn {
-            writer: BufWriter::new(value.clone()),
-            reader: BufReader::new(value),
+        Self::new(value)
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Clone> RpcConn<T> {
+    pub fn new(reader_writer: T) -> Self {
+        Self {
+            writer: BufWriter::new(reader_writer.clone()),
+            reader: BufReader::new(reader_writer),
         }
     }
 }
 
 impl<T: AsyncRead + AsyncWrite + Unpin> RpcConn<T> {
+    pub fn into_inner(self) -> T {
+        self.writer.into_inner()
+    }
+
     async fn call_raw<Code: Into<u32>>(&mut self, code: Code, data: &[u8]) -> io::Result<Vec<u8>> {
         self.send_code(code).await?;
         self.send_data(data).await?;
@@ -153,31 +163,22 @@ impl RpcUserClient {
     }
 }
 
-#[derive(Debug)]
-pub struct RpcUserNotifyClient {
+pub fn rpc_user_notify_stream(
     connection: RpcConn<TcpStream>,
-}
-
-impl RpcUserNotifyClient {
-    pub fn new(connection: RpcConn<TcpStream>) -> Self {
-        Self { connection }
-    }
-
-    pub fn stream(self) -> impl TryStream<Item = anyhow::Result<state::LobbyInfoData>> {
-        futures::stream::try_unfold(self, |mut v| async {
-            let (code, data) = v.connection.recv_call::<RpcNotifyCode>().await?;
-            match code {
-                RpcNotifyCode::Unknown => anyhow::bail!("unknown code"),
-                RpcNotifyCode::LobbyInfo => {
-                    v.connection.recv_call_ret(VoidRet {}).await?;
-                    Ok(Some((
-                        serde_json::from_slice::<state::LobbyInfoData>(&data)?,
-                        v,
-                    )))
-                }
+) -> impl TryStream<Item = anyhow::Result<state::LobbyInfoData>> {
+    futures::stream::try_unfold(connection, |mut v| async {
+        let (code, data) = v.recv_call::<RpcNotifyCode>().await?;
+        match code {
+            RpcNotifyCode::Unknown => anyhow::bail!("unknown code"),
+            RpcNotifyCode::LobbyInfo => {
+                v.recv_call_ret(VoidRet {}).await?;
+                Ok(Some((
+                    serde_json::from_slice::<state::LobbyInfoData>(&data)?,
+                    v,
+                )))
             }
-        })
-    }
+        }
+    })
 }
 
 #[derive(Debug)]
