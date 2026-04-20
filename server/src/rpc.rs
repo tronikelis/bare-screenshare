@@ -221,7 +221,12 @@ impl Drop for RpcServerHandler {
         let server = self.server.clone();
         let id = self.id.clone();
         smol::spawn(async move {
-            server.cleanup(id).await;
+            match server.cleanup(&id).await {
+                Ok(_) => {}
+                Err(v) => {
+                    println!("cleaning up server failed: {v}");
+                }
+            };
         })
         .detach();
     }
@@ -270,8 +275,22 @@ impl RpcServer {
         Ok(())
     }
 
-    async fn cleanup(&self, id: TcpId) {
-        self.lobbies.lock().await.cleanup(id);
+    async fn cleanup(&self, id: &TcpId) -> anyhow::Result<()> {
+        self.cleanup_lobbies(id).await?;
+        Ok(())
+    }
+
+    async fn cleanup_lobbies(&self, id: &TcpId) -> anyhow::Result<()> {
+        let lobby_id = {
+            let mut lobbies = self.lobbies.lock().await;
+            let Some(lobby_id) = lobbies.tcp_id_to_lobby_id.get(id).map(|v| v.clone()) else {
+                return Ok(());
+            };
+            lobbies.cleanup(&id);
+            lobby_id
+        };
+        self.notify_lobby(&lobby_id).await?;
+        Ok(())
     }
 
     async fn notify_lobby(&self, lobby_id: &str) -> anyhow::Result<()> {

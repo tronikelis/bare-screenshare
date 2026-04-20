@@ -18,8 +18,9 @@ impl LobbyClient {
 
 #[derive(Debug)]
 pub struct Lobbies {
+    // TODO: remove pub
     pub map: HashMap<String, Lobby>,
-    tcp_id_to_lobby_id: HashMap<TcpId, String>,
+    pub tcp_id_to_lobby_id: HashMap<TcpId, String>,
 }
 
 impl Lobbies {
@@ -30,14 +31,14 @@ impl Lobbies {
         }
     }
 
-    pub fn cleanup(&mut self, tcp_id: TcpId) {
-        let Some(lobby_id) = self.tcp_id_to_lobby_id.remove(&tcp_id) else {
+    pub fn cleanup(&mut self, tcp_id: &TcpId) {
+        let Some(lobby_id) = self.tcp_id_to_lobby_id.remove(tcp_id) else {
             return;
         };
         let Some(lobby) = self.map.get_mut(&lobby_id) else {
             return;
         };
-        lobby.remove_client(tcp_id);
+        lobby.remove_client(*tcp_id);
         if lobby.clients.len() == 0 {
             self.map.remove(&lobby_id);
         }
