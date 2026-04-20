@@ -227,10 +227,9 @@ impl Drop for RpcServerHandler {
     }
 }
 
-pub async fn create_user_udp_socket(id: &TcpId) -> anyhow::Result<UdpSocket> {
+pub async fn create_user_udp_socket() -> anyhow::Result<UdpSocket> {
     let socket = UdpSocket::bind("127.0.0.1:0").await?;
     socket.connect("127.0.0.1:4000").await?;
-    socket.send(id).await?;
     Ok(socket)
 }
 

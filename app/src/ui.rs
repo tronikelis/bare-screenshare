@@ -16,6 +16,7 @@ use smol::net::UdpSocket;
 
 use crate::{dbus, macros, pipeline, video};
 use server::{
+    conn::TcpId,
     rpc::{JoinLobbyData, RpcUserClient, create_user_udp_socket, rpc_user_notify_stream},
     state::LobbyInfoData,
 };
@@ -233,8 +234,7 @@ impl MyStream {
 pub struct Lobby {
     id: String,
     my_stream: Option<MyStream>,
-    rpc_client: RpcUserClient,
-    udp_socket: UdpSocket,
+    server_client: ServerClient,
 }
 
 #[derive(Debug, Clone)]
@@ -246,27 +246,48 @@ pub enum LobbyMessage {
     RpcNotify(Result<LobbyInfoData, String>),
 }
 
-impl Lobby {
-    pub async fn new(id: String) -> anyhow::Result<(Self, Task<LobbyMessage>)> {
+struct ServerClient {
+    rpc: RpcUserClient,
+    udp_socket: UdpSocket,
+    tcp_id: TcpId,
+}
+
+impl ServerClient {
+    async fn new() -> anyhow::Result<(Self, Task<LobbyMessage>)> {
         let (tcp_id, sender, receiver) = crate::TPC_SEND_RECEIVE_CLIENT.create().await?;
 
-        let notify_stream = rpc_user_notify_stream(receiver.into());
-
-        let task = Task::stream(notify_stream)
+        let task = Task::stream(rpc_user_notify_stream(receiver.into()))
             .map(|v| LobbyMessage::RpcNotify(v.map_err(|e| e.to_string())));
 
-        let mut rpc_client = RpcUserClient::new(sender.into());
-        rpc_client
-            .join_lobby(JoinLobbyData { id: id.clone() })
-            .await?;
+        let rpc = RpcUserClient::new(sender.into());
+        let udp_socket = create_user_udp_socket().await?;
 
-        let udp_socket = create_user_udp_socket(&tcp_id).await?;
+        Ok((
+            Self {
+                rpc,
+                udp_socket,
+                tcp_id,
+            },
+            task,
+        ))
+    }
+
+    async fn join_lobby(&mut self, data: JoinLobbyData) -> anyhow::Result<()> {
+        self.rpc.join_lobby(data).await?;
+        self.udp_socket.send(&self.tcp_id).await?;
+        Ok(())
+    }
+}
+
+impl Lobby {
+    pub async fn new(id: String) -> anyhow::Result<(Self, Task<LobbyMessage>)> {
+        let (mut client, task) = ServerClient::new().await?;
+        client.join_lobby(JoinLobbyData { id: id.clone() }).await?;
 
         Ok((
             Self {
                 id,
-                rpc_client,
-                udp_socket,
+                server_client: client,
                 my_stream: None,
             },
             task,
