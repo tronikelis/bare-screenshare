@@ -1,4 +1,6 @@
 use std::{
+    io,
+    net::SocketAddrV4,
     os::fd::{self, AsRawFd},
     str::FromStr,
 };
@@ -277,6 +279,21 @@ impl ServerClient {
         self.udp_socket.send(&self.tcp_id).await?;
         Ok(())
     }
+
+    async fn send_hello(&mut self, clients: &[SocketAddrV4]) -> anyhow::Result<()> {
+        let self_im = &self;
+        let futs = clients
+            .into_iter()
+            .map(|client| async move {
+                self_im.udp_socket.send_to(b"hello", client).await?;
+                io::Result::Ok(())
+            })
+            .collect::<Vec<_>>();
+        for v in futures::future::join_all(futs).await {
+            v?;
+        }
+        Ok(())
+    }
 }
 
 impl Lobby {
@@ -344,6 +361,21 @@ impl Lobby {
             LobbyMessage::RpcNotify(v) => match v {
                 Ok(v) => {
                     println!("got message: {v:#?}");
+                    smol::block_on(async {
+                        let clients = v
+                            .clients
+                            .iter()
+                            .map(|v| v.udp_addr)
+                            .filter(|v| v.is_some())
+                            .map(|v| match v {
+                                Some(v) => v,
+                                None => unreachable!(),
+                            })
+                            .collect::<Vec<_>>();
+                        println!("hole punching {:?}", &clients);
+                        self.server_client.send_hello(&clients).await
+                    })
+                    .unwrap();
                     Task::none()
                 }
                 Err(e) => {
