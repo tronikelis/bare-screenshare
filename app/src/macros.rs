@@ -7,7 +7,18 @@ macro_rules! clone_expr {
     }};
 }
 
+macro_rules! dbg_err {
+    ($expr:expr) => {{
+        let res = $expr;
+        if let Err(v) = &res {
+            dbg!(v);
+        }
+        res
+    }};
+}
+
 pub(crate) use clone_expr;
+pub(crate) use dbg_err;
 
 // macro_rules! perf_ms {
 //     ($expr:expr) => {{

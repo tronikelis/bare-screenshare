@@ -1,11 +1,12 @@
 use std::{
     io,
     net::SocketAddrV4,
-    os::fd::{self, AsRawFd},
+    os::fd::{self, AsRawFd, RawFd},
     str::FromStr,
 };
 
 use futures::{channel::mpsc, prelude::*, stream};
+use gio::prelude::*;
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app::{self as gst_app};
 use iced::{
@@ -16,10 +17,10 @@ use iced::{
 };
 use smol::net::UdpSocket;
 
-use crate::{dbus, macros, pipeline, video};
+use crate::{dbus, macros::dbg_err, pipeline, video};
 use server::{
     conn::TcpId,
-    rpc::{JoinLobbyData, RpcUserClient, create_user_udp_socket, rpc_user_notify_stream},
+    rpc::{JoinLobbyData, RpcUserClient, rpc_user_notify_stream},
     state::LobbyInfoData,
 };
 
@@ -79,7 +80,9 @@ impl VideoStream {
         };
 
         let task = Task::stream(stream::unfold(message_rx, async |mut message_rx| {
-            message_rx.recv().await.ok().map(|v| (v, message_rx))
+            dbg_err!(message_rx.recv().await)
+                .ok()
+                .map(|v| (v, message_rx))
         }))
         .map(|v| VideoStreamMessage::PipelineMessage(v));
 
@@ -146,7 +149,7 @@ struct MyStream {
 }
 
 impl MyStream {
-    fn new() -> (Self, Task<VideoStreamMessage>) {
+    fn new(sink_socket_fd: RawFd) -> (Self, Task<VideoStreamMessage>) {
         let bus_connection = dbus::bus_connection_get_session();
         let screen_cast_proxy = dbus::ScreenCastProxy::new(bus_connection);
 
@@ -194,8 +197,10 @@ impl MyStream {
             .build()
             .unwrap();
 
-        let udpsink = gst::ElementFactory::make("udpsink")
-            .property("port", 3000)
+        let udpsink = gst::ElementFactory::make("multiudpsink")
+            .property("socket", unsafe {
+                gio::Socket::from_raw_fd(sink_socket_fd).unwrap()
+            })
             .property("async", false)
             .build()
             .unwrap();
@@ -231,11 +236,89 @@ impl MyStream {
             task,
         )
     }
+
+    fn update(&mut self, message: VideoStreamMessage) -> Task<VideoStreamMessage> {
+        self.stream.update(message)
+    }
+
+    fn view(&self) -> Element<'_, VideoStreamMessage> {
+        self.stream.view()
+    }
+
+    fn set_udp_sink(&self, address: &SocketAddrV4) {
+        self.udp_valve.set_property("drop", false);
+
+        println!("setting udpsink to {}", address.to_string());
+        self.udpsink.set_property("clients", address.to_string());
+    }
+}
+
+struct PeerStream {
+    stream: VideoStream,
+}
+
+impl PeerStream {
+    fn new(addr: &SocketAddrV4, src_socket_fd: RawFd) -> (Self, Task<VideoStreamMessage>) {
+        let udpsrc = gst::ElementFactory::make("udpsrc")
+            .property("socket", unsafe {
+                // this closed????
+                gio::Socket::from_raw_fd(src_socket_fd).unwrap()
+            })
+            .property_from_str("address", &addr.ip().to_string())
+            .property_from_str("port", &addr.port().to_string())
+            .property(
+                "caps",
+                &gst::Caps::from_str("application/x-rtp,media=video,payload=96,clock-rate=90000")
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        let h264depay = gst::ElementFactory::make("rtph264depay").build().unwrap();
+        let h264parse = gst::ElementFactory::make("avdec_h264").build().unwrap();
+        let converter = gst::ElementFactory::make("videoconvertscale")
+            .build()
+            .unwrap();
+
+        // TODO: VideoStream should hide this appsink somehow
+        let appsink = gst_app::AppSink::builder()
+            .drop(true)
+            .caps(&gst::Caps::from_str("video/x-raw,format=RGBA").unwrap())
+            .property("emit-signals", true)
+            .build();
+
+        let gst_pipeline = pipeline::Pipeline::new(gst::Pipeline::new())
+            .link([
+                &udpsrc,
+                &h264depay,
+                &h264parse,
+                &converter,
+                &appsink.clone().into(),
+            ])
+            .gst_pipeline();
+
+        let (message_tx, message_rx) = mpsc::channel(1);
+        let (stream, task) = VideoStream::new(
+            video::VideoPipeline::new(message_tx, gst_pipeline, appsink),
+            message_rx,
+        );
+
+        (PeerStream { stream }, task)
+    }
+
+    fn update(&mut self, message: VideoStreamMessage) -> Task<VideoStreamMessage> {
+        self.stream.update(message)
+    }
+
+    fn view(&self) -> Element<'_, VideoStreamMessage> {
+        self.stream.view()
+    }
 }
 
 pub struct Lobby {
     id: String,
     my_stream: Option<MyStream>,
+    peer_stream: Option<PeerStream>,
     server_client: ServerClient,
 }
 
@@ -245,6 +328,7 @@ pub enum LobbyMessage {
     StopStream,
     Leave,
     VideoStreamMessage(VideoStreamMessage),
+    PeerStreamMessage(VideoStreamMessage),
     RpcNotify(Result<LobbyInfoData, String>),
 }
 
@@ -262,7 +346,7 @@ impl ServerClient {
             .map(|v| LobbyMessage::RpcNotify(v.map_err(|e| e.to_string())));
 
         let rpc = RpcUserClient::new(sender.into());
-        let udp_socket = create_user_udp_socket().await?;
+        let udp_socket = UdpSocket::bind("127.0.0.1:0").await?;
 
         Ok((
             Self {
@@ -276,16 +360,18 @@ impl ServerClient {
 
     async fn join_lobby(&mut self, data: JoinLobbyData) -> anyhow::Result<()> {
         self.rpc.join_lobby(data).await?;
-        self.udp_socket.send(&self.tcp_id).await?;
+        self.udp_socket
+            .send_to(&self.tcp_id, "127.0.0.1:4000")
+            .await?;
         Ok(())
     }
 
-    async fn send_hello(&mut self, clients: &[SocketAddrV4]) -> anyhow::Result<()> {
+    async fn send_hello(&mut self, addresses: &[SocketAddrV4]) -> anyhow::Result<()> {
         let self_im = &self;
-        let futs = clients
+        let futs = addresses
             .into_iter()
-            .map(|client| async move {
-                self_im.udp_socket.send_to(b"hello", client).await?;
+            .map(|addr| async move {
+                self_im.udp_socket.send_to(b"hello", addr).await?;
                 io::Result::Ok(())
             })
             .collect::<Vec<_>>();
@@ -306,6 +392,7 @@ impl Lobby {
                 id,
                 server_client: client,
                 my_stream: None,
+                peer_stream: None,
             },
             task,
         ))
@@ -319,7 +406,7 @@ impl Lobby {
         container(match &self.my_stream {
             Some(v) => Element::<LobbyMessage>::from(column!(
                 button("Stop Stream").on_press(LobbyMessage::StopStream),
-                v.stream.view().map(LobbyMessage::VideoStreamMessage),
+                v.view().map(LobbyMessage::VideoStreamMessage),
             )),
             None => button("Start stream")
                 .on_press(LobbyMessage::StartStream)
@@ -329,15 +416,64 @@ impl Lobby {
         .into()
     }
 
+    fn view_peer_stream(&self) -> Option<Element<'_, LobbyMessage>> {
+        self.peer_stream
+            .as_ref()
+            .map(|v| v.view().map(LobbyMessage::PeerStreamMessage))
+    }
+
     pub fn view(&self) -> Element<'_, LobbyMessage> {
         column!(
             container(row!(
                 self.id.as_str(),
                 button("Leave").on_press(LobbyMessage::Leave)
             )),
-            row!(self.view_my_stream(), self.view_clients(),),
+            row!(
+                self.view_my_stream(),
+                self.view_peer_stream(),
+                self.view_clients(),
+            ),
         )
         .into()
+    }
+
+    async fn handle_lobby_info(
+        &mut self,
+        info: LobbyInfoData,
+        tasks: &mut Vec<Task<LobbyMessage>>,
+    ) -> anyhow::Result<()> {
+        let client_addresses = info
+            .clients
+            .iter()
+            .map(|v| v.udp_addr)
+            .filter(|v| v.is_some())
+            .map(|v| match v {
+                Some(v) => v,
+                None => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        println!("hole punching {:?}", &client_addresses);
+        self.server_client.send_hello(&client_addresses).await?;
+
+        if let Some(client) = info.clients.get(0) {
+            if client.is_streaming {
+                let (peer_stream, task) = PeerStream::new(
+                    &client.udp_addr.unwrap(),
+                    self.server_client.udp_socket.as_raw_fd(),
+                );
+                println!("starting peer stream");
+                tasks.push(task.map(LobbyMessage::PeerStreamMessage));
+                self.peer_stream = Some(peer_stream);
+            }
+        }
+
+        if let Some(address) = client_addresses.get(0) {
+            if let Some(my_stream) = &self.my_stream {
+                my_stream.set_udp_sink(address);
+            }
+        }
+
+        Ok(())
     }
 
     pub fn update(&mut self, message: LobbyMessage) -> Task<LobbyMessage> {
@@ -346,12 +482,18 @@ impl Lobby {
                 .my_stream
                 .as_mut()
                 .unwrap()
-                .stream
                 .update(v)
                 .map(LobbyMessage::VideoStreamMessage),
+            LobbyMessage::PeerStreamMessage(v) => self
+                .peer_stream
+                .as_mut()
+                .unwrap()
+                .update(v)
+                .map(LobbyMessage::PeerStreamMessage),
             LobbyMessage::StartStream => {
-                let (my_stream, task) = MyStream::new();
+                let (my_stream, task) = MyStream::new(self.server_client.udp_socket.as_raw_fd());
                 self.my_stream = Some(my_stream);
+                smol::block_on(async { self.server_client.rpc.start_stream().await }).unwrap();
                 task.map(LobbyMessage::VideoStreamMessage)
             }
             LobbyMessage::StopStream => {
@@ -361,22 +503,9 @@ impl Lobby {
             LobbyMessage::RpcNotify(v) => match v {
                 Ok(v) => {
                     println!("got message: {v:#?}");
-                    smol::block_on(async {
-                        let clients = v
-                            .clients
-                            .iter()
-                            .map(|v| v.udp_addr)
-                            .filter(|v| v.is_some())
-                            .map(|v| match v {
-                                Some(v) => v,
-                                None => unreachable!(),
-                            })
-                            .collect::<Vec<_>>();
-                        println!("hole punching {:?}", &clients);
-                        self.server_client.send_hello(&clients).await
-                    })
-                    .unwrap();
-                    Task::none()
+                    let mut tasks = Vec::new();
+                    smol::block_on(async { self.handle_lobby_info(v, &mut tasks).await }).unwrap();
+                    Task::batch(tasks)
                 }
                 Err(e) => {
                     // todo: retry connection

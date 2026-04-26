@@ -105,12 +105,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> RpcConn<T> {
 pub enum RpcCode {
     Unknown = 0,
     JoinLobby = 1,
+    StartStream = 2,
 }
 
 impl From<u32> for RpcCode {
     fn from(value: u32) -> Self {
         match value {
             1 => Self::JoinLobby,
+            2 => Self::StartStream,
             _ => Self::Unknown,
         }
     }
@@ -161,6 +163,13 @@ impl RpcUserClient {
             .call(RpcCode::JoinLobby as u32, data)
             .await?)
     }
+
+    pub async fn start_stream(&mut self) -> anyhow::Result<VoidRet> {
+        Ok(self
+            .connection
+            .call(RpcCode::StartStream as u32, VoidRet {})
+            .await?)
+    }
 }
 
 pub fn rpc_user_notify_stream(
@@ -189,13 +198,24 @@ pub struct RpcServerHandler {
 }
 
 impl RpcServerHandler {
-    async fn handle_join_lobby(&mut self, data: JoinLobbyData) -> anyhow::Result<VoidRet> {
-        self.server
+    async fn handle_join_lobby(&self, data: JoinLobbyData) -> anyhow::Result<VoidRet> {
+        self.server.lobbies.lock().await.join(
+            data.id.clone(),
+            state::LobbyClient::new(self.id, None, false),
+        );
+        self.server.notify_lobby(&data.id).await?;
+        Ok(VoidRet {})
+    }
+
+    async fn handle_start_stream(&self, _data: VoidRet) -> anyhow::Result<VoidRet> {
+        let lobby_id = self
+            .server
             .lobbies
             .lock()
             .await
-            .join(data.id.clone(), state::LobbyClient::new(self.id, None));
-        self.server.notify_lobby(&data.id).await?;
+            .set_client_is_streaming(&self.id, true)
+            .ok_or_else(|| anyhow::anyhow!("start stream no lobby"))?;
+        self.server.notify_lobby(&lobby_id).await?;
         Ok(VoidRet {})
     }
 
@@ -208,6 +228,12 @@ impl RpcServerHandler {
                 RpcCode::JoinLobby => {
                     let ret = self
                         .handle_join_lobby(serde_json::from_slice(&data)?)
+                        .await?;
+                    self.connection.recv_call_ret(ret).await?;
+                }
+                RpcCode::StartStream => {
+                    let ret = self
+                        .handle_start_stream(serde_json::from_slice(&data)?)
                         .await?;
                     self.connection.recv_call_ret(ret).await?;
                 }
@@ -232,12 +258,6 @@ impl Drop for RpcServerHandler {
     }
 }
 
-pub async fn create_user_udp_socket() -> anyhow::Result<UdpSocket> {
-    let socket = UdpSocket::bind("127.0.0.1:0").await?;
-    socket.connect("127.0.0.1:4000").await?;
-    Ok(socket)
-}
-
 impl RpcServer {
     pub fn new(notify_tx: mpsc::Sender<Notify>) -> Self {
         Self {
@@ -260,7 +280,7 @@ impl RpcServer {
             let SocketAddr::V4(v4) = addr else {
                 unreachable!();
             };
-            println!("got udp message: {buf:?}");
+            println!("got udp message: {buf:?}, addr: {addr}");
             let lobby_id = self.lobbies.lock().await.set_client_udp_address(buf, v4);
             if let Some(lobby_id) = lobby_id {
                 self.notify_lobby(&lobby_id).await?;
@@ -283,7 +303,7 @@ impl RpcServer {
     async fn cleanup_lobbies(&self, id: &TcpId) -> anyhow::Result<()> {
         let lobby_id = {
             let mut lobbies = self.lobbies.lock().await;
-            let Some(lobby_id) = lobbies.tcp_id_to_lobby_id.get(id).map(|v| v.clone()) else {
+            let Some(lobby_id) = lobbies.get_tcp_id_lobby(id).map(|v| v.id.clone()) else {
                 return Ok(());
             };
             lobbies.cleanup(&id);
@@ -297,7 +317,7 @@ impl RpcServer {
         println!("notifying lobby \"{lobby_id}\"");
 
         let lobbies = self.lobbies.lock().await;
-        let Some(lobby) = lobbies.map.get(lobby_id) else {
+        let Some(lobby) = lobbies.get(lobby_id) else {
             return Ok(());
         };
 
